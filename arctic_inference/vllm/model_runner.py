@@ -30,6 +30,43 @@ class ArcticGPUModelRunner(GPUModelRunner):
         # definition in order to early-stop the prefill tokens.
         attn_metadata.swiftkv_logits_indices = logits_indices
         return attn_metadata, logits_indices, *rest
+
+    def monkeypatch_forward(self):
+        import torch
+        from vllm.distributed.parallel_state import _SP
+        SP_size = _SP.world_size
+        SP_rank = _SP.rank_in_group
+        device_group = _SP.device_group
+        model_forward = self.model.forward
+
+        def ulysses_forward(*args, **kwargs):
+            # update inputs
+            input_ids = kwargs['input_ids']
+            positions = kwargs['positions']
+            # Ulysses parameters
+            N = input_ids.shape[0]
+            N_ulysses = N // SP_size
+            N_offset = N_ulysses * SP_rank
+            # narrow the input
+            kwargs['input_ids'] = input_ids[N_offset:N_offset + N_ulysses]
+            kwargs['positions'] = positions[N_offset:N_offset + N_ulysses]
+            # original forward
+            output = model_forward(*args, **kwargs)
+            # all-gather model_output
+            model_output = torch.empty((N, self.model.config.hidden_size),
+                                       dtype=output.dtype,
+                                       device=output.device)
+            torch.distributed.all_gather_into_tensor(model_output,
+                                                     output,
+                                                     group=device_group)
+            return model_output
+
+        self.model.forward = ulysses_forward
+
+    def load_model(self, *args, **kwargs):
+        super().load_model(*args, **kwargs)
+        if self.parallel_config.sequence_parallel_size > 1:
+            self.monkeypatch_forward()
     
     from vllm.sequence import IntermediateTensors
     from vllm.v1.outputs import ModelRunnerOutput
