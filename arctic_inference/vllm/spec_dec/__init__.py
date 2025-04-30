@@ -12,21 +12,3 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
-import re
-from importlib.metadata import requires
-
-
-def get_compatible_vllm_version():
-    reqs = requires("arctic_inference")
-    for req in reqs:
-        match = re.match("vllm==(\d+\.\d+\.\d+);", req)
-        if match is not None:
-            return match.groups()[0]
-        
-
-# For debugging
-def print0(*args, **kwargs):
-    from vllm.distributed.parallel_state import get_tp_group
-    if get_tp_group().is_first_rank:
-        print(*args, **kwargs)

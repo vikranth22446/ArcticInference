@@ -21,8 +21,11 @@ from vllm.v1.worker.worker_base import WorkerBase
 from arctic_inference.patching import ArcticPatch
 from arctic_inference.utils import get_compatible_vllm_version
 from arctic_inference.vllm.args import EngineArgsPatch, AsyncEngineArgsPatch
-from arctic_inference.vllm.config import ParallelConfigPatch, VllmConfigPatch
+from arctic_inference.vllm.config import (ParallelConfigPatch,
+                                          SpeculativeConfigPatch,
+                                          VllmConfigPatch)
 from arctic_inference.vllm.ulysses import apply_ulysses_patches
+from arctic_inference.vllm.spec_decoding import apply_spec_decoding_patches
 
 logger = init_logger(__name__)
 
@@ -82,6 +85,14 @@ def arctic_inference_plugin():
     # Register SwiftKV model definitions to vLLM.
     ModelRegistry.register_model("LlamaSwiftKVForCausalLM",
                                  LlamaSwiftKVForCausalLM)
+    
+    # Register ArcticSpeculator models to vLLM.
+    from arctic_inference.vllm.spec_dec.arctic_speculator import (
+        ArcticMLPSpeculator, ArcticLSTMSpeculator)
+    ModelRegistry.register_model("ArcticMLPSpeculatorPreTrainedModel",
+                                 ArcticMLPSpeculator)
+    ModelRegistry.register_model("ArcticLSTMSpeculatorPreTrainedModel",
+                                 ArcticLSTMSpeculator)
 
     # Patches that make later patches work properly.
     EngineCoreProcPatch.apply_patch()
@@ -91,7 +102,9 @@ def arctic_inference_plugin():
     EngineArgsPatch.apply_patch()
     AsyncEngineArgsPatch.apply_patch()
     ParallelConfigPatch.apply_patch()
+    SpeculativeConfigPatch.apply_patch()
     VllmConfigPatch.apply_patch()
 
     # Main optimization patches.
     apply_ulysses_patches()
+    apply_spec_decoding_patches()

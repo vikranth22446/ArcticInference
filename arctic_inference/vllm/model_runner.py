@@ -14,14 +14,19 @@
 # limitations under the License.
 
 import time
-from typing import Union, Optional, TYPE_CHECKING
+from typing import List, Union, Optional, TYPE_CHECKING
 
+import numpy as np
 import torch
+import torch.nn as nn
 from vllm.config import CompilationLevel
 from vllm.distributed.parallel_state import get_pp_group, graph_capture
 from vllm.forward_context import set_forward_context
+from vllm.config import VllmConfig, SpeculativeConfig
+from vllm.model_executor.model_loader import get_model
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
+from vllm.v1.sample.rejection_sampler import MAX_SPEC_LEN
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
@@ -29,13 +34,55 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
+from arctic_inference.common.suffix_cache import SuffixCache
 from arctic_inference.patching import ArcticPatch
+from arctic_inference.vllm.spec_dec.arctic_proposer import ArcticProposer
+from arctic_inference.common.suffix_cache import SuffixSpecResult
 
 
 class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
     _orig_prepare_inputs = GPUModelRunner._prepare_inputs
     _orig_load_model = GPUModelRunner.load_model
+    _orig_init = GPUModelRunner.__init__
+
+    def __init__(self: GPUModelRunner, vllm_config: VllmConfig,
+                 *args, **kwargs):
+
+        speculative_config = vllm_config.speculative_config
+
+        vllm_config.speculative_config = None
+        self._orig_init(vllm_config, *args, **kwargs)
+
+        # Set up speculative decoding.
+        self._suffix_cache = None
+        if speculative_config:
+            self.use_spec_decode = True
+            self.speculative_config = speculative_config
+
+            from vllm.distributed.parallel_state import get_pp_group
+            if get_pp_group().is_last_rank:
+                if self.speculative_config.method == "ngram":
+                    self.drafter = NgramProposer(self.vllm_config)
+                elif self.speculative_config.method == "eagle":
+                    self.drafter = EagleProposer(self.vllm_config,
+                                                 self.device)  # type: ignore
+                elif (self.speculative_config.method == "arctic" or
+                      self.speculative_config.method == "mlp_speculator"):
+                    self.drafter = ArcticProposer(self.vllm_config,
+                                                  self.speculative_config)
+                elif self.speculative_config.method != "suffix":
+                    raise ValueError("Unknown speculative decoding method: "
+                                     f"{self.speculative_config.method}")
+                
+                from vllm.v1.sample.rejection_sampler import RejectionSampler
+                self.rejection_sampler = RejectionSampler()
+
+            if speculative_config.enable_suffix_decoding:
+                self._suffix_cache = SuffixCache(
+                    speculative_config.suffix_cache_max_depth)
+
+        vllm_config.speculative_config = speculative_config
 
     def _prepare_inputs(self, *args, **kwargs):
         attn_metadata, logits_indices, *rest = (
@@ -45,7 +92,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         attn_metadata.swiftkv_logits_indices = logits_indices
         return attn_metadata, logits_indices, *rest
 
-    def monkeypatch_forward(self):
+    def monkeypatch_forward(self: GPUModelRunner):
         from vllm.distributed.parallel_state import _SP
         SP_size = _SP.world_size
         SP_rank = _SP.rank_in_group
@@ -76,14 +123,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         self.model.forward = ulysses_forward
 
-    def load_model(self, *args, **kwargs):
+    def load_model(self: GPUModelRunner, *args, **kwargs):
         self._orig_load_model(*args, **kwargs)
         if self.parallel_config.sequence_parallel_size > 1:
             self.monkeypatch_forward()
     
     @torch.inference_mode()
     def execute_model(
-        self,
+        self: GPUModelRunner,
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, torch.Tensor]:
@@ -255,13 +302,57 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
 
-        if not self.use_spec_decode:
+        disable_spec_decode = (
+            self.speculative_config and
+            self.speculative_config.disable_by_batch_size and
+            len(self.input_batch.req_ids) > self.speculative_config.disable_by_batch_size
+        )
+
+        suffix_spec_token_ids = None
+        orig_sampled_token_ids = valid_sampled_token_ids.copy()
+        if self._suffix_cache is not None:
+            self._update_suffix_cache(valid_sampled_token_ids)
+            if not disable_spec_decode:
+                results = self.generate_draft_token_ids_suffix(
+                    valid_sampled_token_ids)
+                suffix_spec_token_ids = []
+                # The score is an estimate of the acceptance length. Thus, the
+                # heuristic is to use the suffix decoded tokens if the score is
+                # greater than the # of tokens we would speculate otherwise.
+                min_score = (self.speculative_config.num_speculative_tokens
+                             if self.speculative_config.method != "suffix"
+                             else 0)
+                min_score = (0 if self.speculative_config.method == "suffix"
+                             else self.speculative_config.num_speculative_tokens)
+                for i, result in enumerate(results):
+                    if result.score >= min_score:
+                        # Use suffix decoded tokens, disable other speculation
+                        # methods for this request.
+                        valid_sampled_token_ids[i] = []
+                        suffix_spec_token_ids.append(result.token_ids)
+                    else:
+                        suffix_spec_token_ids.append([])
+
+        spec_token_ids = None
+        if not self.use_spec_decode or disable_spec_decode:
             # Speculative decoding is not enabled.
-            spec_token_ids = None
+            pass
         elif self.speculative_config.method == "ngram":
             assert isinstance(self.drafter, NgramProposer)
             spec_token_ids = self.generate_draft_token_ids(
                 valid_sampled_token_ids, sampling_metadata)
+        elif (self.speculative_config.method == "arctic" or 
+              self.speculative_config.method == "mlp_speculator"):
+            assert isinstance(self.drafter, ArcticProposer)
+            previous_hidden_states = self.drafter.prepare_hidden_states(
+                sample_hidden_states=sample_hidden_states,
+                sampled_token_ids=sampled_token_ids,
+                spec_decode_metadata=spec_decode_metadata,
+            )
+            spec_token_ids = self.generate_draft_token_ids_arctic(
+                valid_sampled_token_ids, 
+                previous_hidden_states=previous_hidden_states)
+            #print0(f"spec_token_ids: {spec_token_ids}")
         elif self.speculative_config.method == "eagle":
             assert isinstance(self.drafter, EagleProposer)
             # TODO(woosuk): Refactor the loop.
@@ -329,6 +420,16 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # in the next step.
             del draft_probs
 
+        if spec_token_ids is None:
+            spec_token_ids = suffix_spec_token_ids
+        elif suffix_spec_token_ids is not None:
+            spec_token_ids = [
+                suffix_spec_token_ids[i] or spec_token_ids[i]
+                for i in range(len(suffix_spec_token_ids))
+            ]
+
+        valid_sampled_token_ids = orig_sampled_token_ids
+
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -338,6 +439,117 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             prompt_logprobs_dict=prompt_logprobs_dict,
         )
     
+    def generate_draft_token_ids_arctic(
+        self,
+        sampled_token_ids: list[list[int]],
+        previous_hidden_states: Optional[torch.Tensor] = None,
+    ) -> list[list[int]]:
+        last_tokens : list[int] = []
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            num_sampled_ids = len(sampled_ids)
+            
+            if (num_sampled_ids == 0):
+                # uncommmon case
+                return None
+
+            # Add sampled_token_ids to token_ids_cpu.
+            start_idx = self.input_batch.num_tokens_no_spec[i]
+            end_idx = start_idx + num_sampled_ids
+            self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
+            last_tokens.append(self.input_batch.token_ids_cpu[i, end_idx - 1])
+
+        drafter_output = self.drafter.propose(
+            last_tokens,
+            previous_hidden_states=previous_hidden_states,
+        )
+
+        draft_token_ids = drafter_output.tolist()
+
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            if not sampled_ids:
+                draft_token_ids[i] = []
+
+        return draft_token_ids
+
+    def _update_suffix_cache(self, sampled_token_ids: list[list[int]]) -> None:
+        seen_req_ids = set()
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            req_id = self.input_batch.req_ids[i]
+            seen_req_ids.add(req_id)
+
+            if not sampled_ids:
+                continue
+
+            index = self.input_batch.req_id_to_index[req_id]
+            if not self._suffix_cache.has_cached_prompt(req_id):
+                num_prompt_tokens = self.input_batch.num_prompt_tokens[index]
+                prompt_token_ids = (
+                    self.input_batch.token_ids_cpu[index, :num_prompt_tokens])
+                self._suffix_cache.cache_prompt(req_id, prompt_token_ids)
+
+            self._suffix_cache.update_response(req_id, sampled_ids)
+
+        # Evict prompts that are not seen
+        for req_id in self._suffix_cache.cached_prompt_ids():
+            if req_id not in seen_req_ids:
+                self._suffix_cache.evict_prompt(req_id)
+
+    def generate_draft_token_ids_suffix(
+        self,
+        sampled_token_ids: list[list[int]],
+        spec_token_ids: Optional[list[list[int]]] = None,
+    ) -> list[list[int]]:
+        config = self.speculative_config
+        results = []
+        for i, sampled_ids in enumerate(sampled_token_ids):
+            spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+            num_sampled_ids = len(sampled_ids)
+            if not num_sampled_ids:
+                # Skip speculative decoding.
+                results.append(SuffixSpecResult())
+                continue
+
+            req_id = self.input_batch.req_ids[i]
+
+            # Add sampled_token_ids to token_ids_cpu.
+            start_idx = self.input_batch.num_tokens_no_spec[i]
+            end_idx = start_idx + len(sampled_ids)
+            self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
+
+            size = min(end_idx, config.suffix_cache_max_depth)
+            pattern = self.input_batch.token_ids_cpu[i, end_idx-size:end_idx]
+            pattern = pattern.tolist() + spec_ids
+            if len(pattern) > config.suffix_cache_max_depth:
+                pattern = pattern[-config.suffix_cache_max_depth:]
+            max_spec_tokens = min(MAX_SPEC_LEN - len(spec_ids),
+                                  config.suffix_cache_max_depth)
+            # max_spec_offset is modified to mimic the behavior of the original
+            # max_spec_factor and max_spec_offset as if the speculative tokens
+            # were generated by suffix decoding. For example, if:
+            #   - max_spec_factor = 2
+            #   - max_spec_offset = -1
+            #   - we've already speculated 3 tokens
+            #   - and the suffix match length is 6
+            # Then:
+            #   - The match length before the already-speculated tokens is 3
+            #   - The original config allow up to 5 speculated tokens total
+            #   - Already speculated 3 tokens, so should allow 2 more tokens
+            # So the new config should map match length 6 to 2 max spec tokens.
+            max_spec_factor = config.suffix_max_spec_factor
+            max_spec_offset = (config.suffix_max_spec_offset -
+                              len(spec_ids) * (max_spec_factor + 1))
+            result = self._suffix_cache.speculate(
+                req_id,
+                pattern,
+                max_spec_tokens=max_spec_tokens,
+                max_spec_factor=max_spec_factor,
+                max_spec_offset=max_spec_offset,
+                min_token_prob=config.suffix_min_token_prob)
+
+            results.append(result)
+
+        return results
+
     def capture_model(self) -> None:
         if not self.use_cuda_graph:
             logger.warning(
