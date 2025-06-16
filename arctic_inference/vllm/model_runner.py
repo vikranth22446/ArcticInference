@@ -128,7 +128,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # Restore the speculative config.
             self.vllm_config.speculative_config = arctic_speculative_config
             self.speculative_config = arctic_speculative_config
-            self.use_spec_decode = True
 
             if get_pp_group().is_last_rank:
                 if (self.speculative_config.method == "arctic" or
@@ -209,49 +208,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         self.model.forward = ulysses_forward
 
-    def load_model(self: GPUModelRunner, *args, **kwargs):
-        load_shift_model = (
-            self.vllm_config.parallel_config.enable_shift_parallel)
-
-        if load_shift_model:
-            # Make a deep copy of the config before loading the model.
-            shift_config = copy.deepcopy(self.vllm_config)
-
-        self._orig_load_model(*args, **kwargs)
-
-        if self.parallel_config.ulysses_sequence_parallel_size > 1:
-            self.monkeypatch_forward()
-
-        if load_shift_model:
-            shift_config.parallel_config.tensor_parallel_size *= (
-                shift_config.parallel_config.ulysses_sequence_parallel_size)
-            shift_config.parallel_config.ulysses_sequence_parallel_size = 1
-            with set_shift_parallel_mode(True):
-                self.shift_model = get_model(vllm_config=shift_config)
-            self.shift_parallel_threshold = (
-                shift_config.parallel_config.shift_parallel_threshold)
-            if "SwiftKV" in self.model.__class__.__name__:
-                # HACK: Replace the decode-runner since it always runs in full
-                # TP, but the original model is captured using SP * BATCH_SIZE,
-                # which does not cover all its cuda graph sizes. The shift-mode
-                # model should have all its cuda graphs captured correctly.
-                self.model.model.decode_runner = (
-                    self.shift_model.model.decode_runner)
-        else:
-            self.shift_model = None
-            self.shift_parallel_threshold = 0
-
-    def initialize_kv_cache(self, kv_cache_config: "KVCacheConfig") -> None:
-        self._orig_initialize_kv_cache(kv_cache_config)
-
-        if self.shift_model is not None:
-            # Bind the KV caches to the shift parallel model.
-            forward_context = (
-                self.vllm_config.compilation_config.static_forward_context)
-            for mod in self.shift_model.modules():
-                if isinstance(mod, Attention):
-                    mod.kv_cache = forward_context[mod.layer_name].kv_cache
-
     @torch.inference_mode()
     def execute_model(
         self,
@@ -302,6 +258,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 else:
                     num_input_tokens = num_scheduled_tokens
 
+        # Padding for DP
+        num_pad, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
+        num_input_tokens += num_pad
+
         # _prepare_inputs may reorder the batch, so we must gather multi
         # modal outputs after that to ensure the correct order
         if self.is_multimodal_model:
@@ -347,7 +307,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # Use persistent buffers for CUDA graphs.
         with set_forward_context(attn_metadata,
                                  self.vllm_config,
-                                 num_tokens=num_input_tokens):
+                                 num_tokens=num_input_tokens,
+                                 num_tokens_across_dp=num_tokens_across_dp):
             self.maybe_setup_kv_connector(scheduler_output)
 
             model = self.shift_model if use_shift_model else self.model
@@ -509,7 +470,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                         suffix_spec_token_ids.append([])
 
         spec_token_ids = None
-        if not self.use_spec_decode or disable_spec_decode:
+        if not self.speculative_config or disable_spec_decode:
             # Speculative decoding is not enabled.
             pass
         elif (self.speculative_config.method == "arctic" or 
@@ -767,6 +728,38 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         return results
 
+    def load_model(self) -> None:
+        load_shift_model = (
+            self.vllm_config.parallel_config.enable_shift_parallel)
+
+        if load_shift_model:
+            # Make a deep copy of the config before loading the model.
+            shift_config = copy.deepcopy(self.vllm_config)
+
+        self._orig_load_model()
+
+        if self.parallel_config.ulysses_sequence_parallel_size > 1:
+            self.monkeypatch_forward()
+
+        if load_shift_model:
+            shift_config.parallel_config.tensor_parallel_size *= (
+                shift_config.parallel_config.ulysses_sequence_parallel_size)
+            shift_config.parallel_config.ulysses_sequence_parallel_size = 1
+            with set_shift_parallel_mode(True):
+                self.shift_model = get_model(vllm_config=shift_config)
+            self.shift_parallel_threshold = (
+                shift_config.parallel_config.shift_parallel_threshold)
+            if "SwiftKV" in self.model.__class__.__name__:
+                # HACK: Replace the decode-runner since it always runs in full
+                # TP, but the original model is captured using SP * BATCH_SIZE,
+                # which does not cover all its cuda graph sizes. The shift-mode
+                # model should have all its cuda graphs captured correctly.
+                self.model.model.decode_runner = (
+                    self.shift_model.model.decode_runner)
+        else:
+            self.shift_model = None
+            self.shift_parallel_threshold = 0
+
     def capture_model(self) -> None:
         if not self.use_cuda_graph:
             logger.warning(
@@ -809,3 +802,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # This usually takes 5~20 seconds.
         logger.info("Graph capturing finished in %.0f secs, took %.2f GiB",
                     elapsed_time, cuda_graph_size / (1 << 30))
+
+    def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
+        self._orig_initialize_kv_cache(kv_cache_config)
+
+        if self.shift_model is not None:
+            # Bind the KV caches to the shift parallel model.
+            forward_context = (
+                self.vllm_config.compilation_config.static_forward_context)
+            for mod in self.shift_model.modules():
+                if isinstance(mod, Attention):
+                    mod.kv_cache = forward_context[mod.layer_name].kv_cache
