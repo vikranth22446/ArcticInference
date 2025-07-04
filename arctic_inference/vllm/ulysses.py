@@ -16,7 +16,7 @@
 import threading
 import weakref
 from concurrent.futures import ThreadPoolExecutor
-from typing import Optional
+from typing import Optional, Any
 
 import torch
 import vllm.distributed.parallel_state as parallel_state
@@ -29,10 +29,12 @@ from vllm.distributed.parallel_state import (init_model_parallel_group,
 from vllm.executor.multiproc_worker_utils import (
     set_multiprocessing_worker_envs)
 from vllm.utils import get_distributed_init_method, get_open_port
-from vllm.v1.attention.backends.flash_attn import FlashAttentionImpl
 from vllm.v1.executor.abstract import FailureCallback
 from vllm.v1.executor.multiproc_executor import (MultiprocExecutor, WorkerProc,
                                                  UnreadyWorkerProcHandle)
+from vllm.platforms import current_platform
+from vllm.utils import resolve_obj_by_qualname
+from vllm.compilation.backends import PiecewiseCompileInterpreter
 
 from arctic_inference.patching import ArcticPatch
 
@@ -42,7 +44,7 @@ def apply_shift_parallel_patches():
     UlyssesParallelStatePatch.apply_patch()
     UlyssesMultiprocExecutorPatch.apply_patch()
     UlyssesAttentionPatch.apply_patch()
-    UlyssesFlashAttentionImplPatch.apply_patch()
+    PiecewiseCompileInterpreterPatch.apply_patch()
 
 
 class UlyssesModelConfigPatch(ArcticPatch[ModelConfig]):
@@ -337,6 +339,7 @@ class UlyssesAttentionPatch(ArcticPatch[Attention]):
     def __init__(self, num_heads, *args, **kwargs):
         from .model_runner import is_shift_parallel_mode
         self.sp_size = parallel_state._SP.world_size
+        self.device_group = parallel_state._SP.device_group
         if not is_shift_parallel_mode():
             num_heads //= self.sp_size
             kwargs["num_kv_heads"] //= self.sp_size
@@ -347,66 +350,101 @@ class UlyssesAttentionPatch(ArcticPatch[Attention]):
         if self.sp_size == 1 or is_shift_parallel_mode():
             return self._orig_forward(query, key, value, **kwargs)
 
-        from vllm.forward_context import get_forward_context
-        if self.calculate_kv_scales:
-            attn_metadata = get_forward_context().attn_metadata
-            if attn_metadata.enable_kv_scales_calculation:
-                self.calc_kv_scales(key, value)
-        hidden_size = query.shape[-1]
-        output = torch.empty_like(query)
-        torch.ops.vllm.unified_attention_with_output(
-                    query, key, value, output, self.layer_name)
-        return output.view(-1, hidden_size)
-
-
-class UlyssesFlashAttentionImplPatch(ArcticPatch[FlashAttentionImpl]):
-
-    _orig_forward = FlashAttentionImpl.forward
-
-    def forward(self, layer, query, key, value, kv_cache, attn_metadata, output):
-        from .model_runner import is_shift_parallel_mode
-
-        assert output is not None, "Output tensor must be provided."
-        if attn_metadata is None:
-            # Profiling run.
-            return output
-
-        sp_size = parallel_state._SP.world_size
-        device_group = parallel_state._SP.device_group
-
-        if sp_size == 1 or is_shift_parallel_mode():
-            return self._orig_forward(layer, query, key, value, kv_cache,
-                                      attn_metadata, output)
-
-        qkv = torch.cat(
-            (query.view(-1, sp_size, self.num_heads * self.head_size),
-                key.view(-1, sp_size, self.num_kv_heads * self.head_size),
-                value.view(-1, sp_size, self.num_kv_heads * self.head_size)),
-            dim=-1).transpose(0, 1).reshape(-1,
-                (self.num_heads + 2 * self.num_kv_heads) * self.head_size)
-        # all-to-all
+        # pack
+        qkv = (torch.cat(
+            (query.view(-1, self.sp_size, self.num_heads * self.head_size),
+             key.view(-1, self.sp_size, self.num_kv_heads * self.head_size),
+             value.view(-1, self.sp_size, self.num_kv_heads * self.head_size)),
+            dim=-1)
+               .transpose(0, 1)
+               .reshape(-1, (self.num_heads + 2 * self.num_kv_heads) * self.head_size))
+        # Ulysses all-to-all 1/2
         qkv_ = torch.empty_like(qkv)
-        torch.distributed.all_to_all_single(qkv_,
-                                            qkv,
-                                            group=device_group)
+        torch.distributed.all_to_all_single(qkv_, qkv, group=self.device_group)
         # unpack
         q_, k_, v_ = qkv_.split([
             self.num_heads * self.head_size, self.num_kv_heads *
             self.head_size, self.num_kv_heads * self.head_size
         ], dim=-1)
-        # prepare
-        q_ = q_.reshape(-1, self.num_heads, self.head_size)
-        k_ = k_.reshape(-1, self.num_kv_heads, self.head_size)
-        v_ = v_.reshape(-1, self.num_kv_heads, self.head_size)
-        c_ = output.view(-1, self.num_heads, self.head_size)
 
         # original attention
-        self._orig_forward(layer, q_, k_, v_, kv_cache, attn_metadata, c_)
+        c_ = self._orig_forward(q_, k_, v_, **kwargs)
 
         # Ulysses all-to-all 2/2
         c = torch.empty_like(c_)
-        torch.distributed.all_to_all_single(c, c_, group=device_group)
-        output.copy_(c.view(sp_size, -1, self.num_heads * self.head_size)
-                     .transpose(0, 1)
-                     .reshape(-1, self.num_heads * sp_size * self.head_size))
+        torch.distributed.all_to_all_single(c, c_, group=self.device_group)
+        output = (c.view(self.sp_size, -1, self.num_heads * self.head_size)
+                  .transpose(0, 1)
+                  .reshape(-1, self.num_heads * self.sp_size * self.head_size))
+        
+        return output
+
+
+class PiecewiseCompileInterpreterPatch(ArcticPatch[PiecewiseCompileInterpreter]):
+
+    # find the symbolic shape of the subgraph
+    def find_symbolic_shape(self, args: tuple[torch.fx.node.Argument,
+                                ...]) -> torch.SymInt:
+        symbols = set()
+        for x in args:
+            if isinstance(x, torch._subclasses.fake_tensor.FakeTensor):
+                for dim in x.shape:
+                    if isinstance(dim, torch.SymInt):
+                        symbols.update(dim.node.expr.free_symbols)
+        assert len(symbols) == 1, (
+            f"Expected exactly one symbolic shape, but found {len(symbols)}: {symbols}")
+        return list(symbols)[0]
+  
+    def call_module(self, target: torch.fx.node.Target,
+                    args: tuple[torch.fx.node.Argument,
+                                ...], kwargs: dict[str, Any]) -> Any:
+        assert isinstance(target, str)
+        # [Arctic Inference]
+        # Since monkeypatching inherits the original class
+        # through ArcticPatch class, we lose the access to the original class'
+        # super() function. Instead of using super(), we directly invoke call_module
+        # from the super class torch.fx.Interpreter of PiecewiseCompileInterpreter.
+        # see - v0.9.0.1/compilation/backends.py#L241
+        output = torch.fx.Interpreter.call_module(self, target, args, kwargs)
+
+        if target in self.compile_submod_names:
+            index = self.compile_submod_names.index(target)
+            submod = self.fetch_attr(target)
+            # [Arctic Inference]
+            # Compiler may create subgraphs with certain symbolic
+            # integer values that violates vllm's assumption here:
+            # - v0.9.0.1/compilation/base_piecewise_backend.py#L64
+            # The index of the significant symbol determines the runtime shape here:
+            # - v0.9.0.1/compilation/cuda_piecewise_backend.py#L112
+            # The fix is relaxing vllm's original assumption that there is only a
+            # single symbolic that determines the shape.We then find the matching 
+            # symbol indices.
+            sym_shape = self.find_symbolic_shape(args)
+            sym_shape_indices = []
+            for i, x in enumerate(args):
+                if isinstance(x, torch.SymInt):
+                    if sym_shape == x:
+                        sym_shape_indices.append(i)
+
+            global compilation_start_time
+            compiled_graph_for_general_shape = self.vllm_backend.\
+                compiler_manager.compile(
+                submod,
+                args,
+                self.compilation_config.inductor_compile_config,
+                self.compilation_config,
+                graph_index=index,
+                num_graphs=len(self.compile_submod_names),
+                runtime_shape=None)
+
+            piecewise_backend = resolve_obj_by_qualname(
+                current_platform.get_piecewise_backend_cls())
+            self.module.__dict__[target] = piecewise_backend(
+                submod, self.vllm_config, self.graph_pool, index,
+                len(self.compile_submod_names), sym_shape_indices,
+                compiled_graph_for_general_shape, self.vllm_backend)
+
+            from vllm.compilation.counter import compilation_counter
+            compilation_counter.num_piecewise_capturable_graphs_seen += 1
+
         return output
