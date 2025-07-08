@@ -39,7 +39,7 @@ packages = [
 
 [project.optional-dependencies]
 vllm = [
-    'vllm==0.9.1',
+    'vllm==0.9.2',
 ]
 
 docs = [
@@ -55,8 +55,8 @@ test = [
 ]
 
 embedding = [
-    "vllm==0.9.1",
-    # uv pip install vllm==0.9.1 --dry-run 2>&1 | grep protobuf | sed 's/^ + //'
+    "vllm==0.9.2",
+    # uv pip install vllm==0.9.2 --dry-run 2>&1 | grep protobuf | sed 's/^ + //'
     "protobuf==5.29.5",
 ]
 
