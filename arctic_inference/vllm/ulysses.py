@@ -100,6 +100,7 @@ class UlyssesParallelStatePatch(ArcticPatch[parallel_state]):
     # all-to-all within SP_AA group followed by an local all-gather within SP_AG
     # group. The SP_AA and SP_AG groups partitions the SP group into two orthogonal
     # sub-groups and will not be initialized if max(1, num_kv_heads / TP) < SP.
+    # See the figure in PR #126 https://github.com/snowflakedb/ArcticInference/pull/126
 
     def initialize_model_parallel(
         tensor_model_parallel_size: int = 1,
