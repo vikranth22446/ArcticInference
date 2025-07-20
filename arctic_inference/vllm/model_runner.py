@@ -17,6 +17,7 @@ import contextlib
 import copy
 import time
 from typing import Any, Union, Optional, TYPE_CHECKING
+from itertools import tee
 
 import numpy as np
 import torch
@@ -771,12 +772,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         with parallel_state.graph_capture(device=self.device):
             sp_size = self.parallel_config.ulysses_sequence_parallel_size
             full_cg = self.full_cuda_graph
-            # capture original model
+            # capture original model shapes
             compilation_cases = (shape for shape in reversed(self.cudagraph_batch_sizes)
-                if shape * sp_size > self.shift_parallel_threshold and
-                    shape * sp_size <= self.max_num_tokens)
+                if shape * sp_size > self.shift_parallel_threshold
+                and shape * sp_size <= self.max_num_tokens)
             # Only rank 0 should print progress bar during capture
             if is_global_first_rank():
+                print_cases, compilation_cases = tee(compilation_cases)
+                logger.info(f"original model shapes {list(print_cases)}")
                 compilation_cases = tqdm(list(compilation_cases),
                                          desc="Capturing CUDA graph shapes of original model")
             for num_tokens in compilation_cases:
@@ -790,18 +793,20 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                                 capture_attn_cudagraph=full_cg,
                                 skip_eplb=True)
 
-            # Capture shift model
+            # Capture shift model shapes
             if self.shift_model is not None:
                 orig_model, self.model = self.model, self.shift_model
                 # Reset compilation cases
                 compilation_cases = (shape for shape in reversed(self.cudagraph_batch_sizes)
-                    if shape <= self.shift_parallel_threshold or
-                        "SwiftKV" in self.model.__class__.__name__)
-                        # Note: We want to capture all shapes for the SwiftKV shift model.
-                        # This is necessary since SwiftKV always uses full TP for the decode runner.
-                        # For all other models, we only capture necessary shapes for the SP_TP mode,
-                        # yealding less setup time.
+                    if shape <= self.shift_parallel_threshold
+                    or "SwiftKV" in self.model.__class__.__name__)
+                # Note: We want to capture all shapes for the SwiftKV shift model.
+                # This is necessary since SwiftKV always uses full TP for the decode runner.
+                # For all other models, we only capture necessary shapes for the SP_TP mode,
+                # yielding less setup time.
                 if is_global_first_rank():
+                    print_cases, compilation_cases = tee(compilation_cases)
+                    logger.info(f"shift model shapes {list(print_cases)}")
                     compilation_cases = tqdm(list(compilation_cases),
                                              desc="Capturing CUDA graph shapes of shift model")
                 with set_shift_parallel_mode(True):
