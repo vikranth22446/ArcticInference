@@ -771,42 +771,49 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         with parallel_state.graph_capture(device=self.device):
             sp_size = self.parallel_config.ulysses_sequence_parallel_size
             full_cg = self.full_cuda_graph
+            # capture original model
+            compilation_cases = (shape for shape in reversed(self.cudagraph_batch_sizes)
+                if shape * sp_size > self.shift_parallel_threshold and
+                    shape * sp_size <= self.max_num_tokens)
             # Only rank 0 should print progress bar during capture
-            compilation_cases = reversed(self.cudagraph_batch_sizes)
             if is_global_first_rank():
                 compilation_cases = tqdm(list(compilation_cases),
-                                         desc="Capturing CUDA graph shapes")
+                                         desc="Capturing CUDA graph shapes of original model")
             for num_tokens in compilation_cases:
                 # We skip EPLB here since we don't want to record dummy metrics
-                if (num_tokens * sp_size > self.shift_parallel_threshold and
-                      num_tokens * sp_size <= self.max_num_tokens):
-                    for _ in range(self.vllm_config.compilation_config.
-                                   cudagraph_num_of_warmups):
-                        self._dummy_run(num_tokens * sp_size,
-                                        capture_attn_cudagraph=full_cg,
-                                        skip_eplb=True)
+                for _ in range(self.vllm_config.compilation_config.
+                               cudagraph_num_of_warmups):
                     self._dummy_run(num_tokens * sp_size,
                                     capture_attn_cudagraph=full_cg,
                                     skip_eplb=True)
+                self._dummy_run(num_tokens * sp_size,
+                                capture_attn_cudagraph=full_cg,
+                                skip_eplb=True)
 
+            # Capture shift model
             if self.shift_model is not None:
                 orig_model, self.model = self.model, self.shift_model
-                for num_tokens in compilation_cases:
-                    if (num_tokens <= self.shift_parallel_threshold or 
-                          "SwiftKV" in self.model.__class__.__name__):
+                # Reset compilation cases
+                compilation_cases = (shape for shape in reversed(self.cudagraph_batch_sizes)
+                    if shape <= self.shift_parallel_threshold or
+                        "SwiftKV" in self.model.__class__.__name__)
                         # Note: We want to capture all shapes for the SwiftKV shift model.
                         # This is necessary since SwiftKV always uses full TP for the decode runner.
                         # For all other models, we only capture necessary shapes for the SP_TP mode,
                         # yealding less setup time.
-                        with set_shift_parallel_mode(True):
-                            for _ in range(self.vllm_config.compilation_config.
-                                            cudagraph_num_of_warmups):
-                                self._dummy_run(num_tokens,
-                                                capture_attn_cudagraph=full_cg,
-                                                skip_eplb=True)
+                if is_global_first_rank():
+                    compilation_cases = tqdm(list(compilation_cases),
+                                             desc="Capturing CUDA graph shapes of shift model")
+                with set_shift_parallel_mode(True):
+                    for num_tokens in compilation_cases:
+                        for _ in range(self.vllm_config.compilation_config.
+                                       cudagraph_num_of_warmups):
                             self._dummy_run(num_tokens,
-                                                capture_attn_cudagraph=full_cg,
-                                                skip_eplb=True)
+                                            capture_attn_cudagraph=full_cg,
+                                            skip_eplb=True)
+                        self._dummy_run(num_tokens,
+                                        capture_attn_cudagraph=full_cg,
+                                        skip_eplb=True)
                 self.model = orig_model
 
         end_time = time.perf_counter()
