@@ -535,6 +535,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         spec_decode_metadata: Optional[SpecDecodeMetadata],
         attn_metadata: dict[str, Any],
     ) -> list[list[int]]:
+        #print('\n batchsize: ', len(self.input_batch.req_ids))
         disable_spec_decode = (
             self.speculative_config and
             self.speculative_config.disable_by_batch_size and
