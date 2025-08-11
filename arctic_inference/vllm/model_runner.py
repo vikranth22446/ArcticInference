@@ -16,9 +16,13 @@
 import contextlib
 import copy
 import time
+import threading
 from typing import Any, Union, Optional, TYPE_CHECKING
 from itertools import tee
-
+from datetime import datetime
+import os
+import json
+import re
 import numpy as np
 import torch
 import vllm.distributed.parallel_state as parallel_state
@@ -53,6 +57,30 @@ from arctic_inference.common.suffix_cache import SuffixSpecResult
 
 SP_TP_MODE = None
 
+# Hard problems list for suffix tree decoding.   (10,12)()()()()
+HARD_PROBLEMS = {
+    "prob_0056", "prob_0095", "prob_0077", "prob_0051", "prob_0067",
+    "prob_0061", "prob_0019", "prob_0002", "prob_0026", "prob_0055",
+    "prob_0074", "prob_0031", "prob_0012", "prob_0034", "prob_0010",
+    "prob_0024", "prob_0046", "prob_0081", "prob_0064", "prob_0090"
+}
+
+# Configuration for hard problems only suffix decoding
+ENABLE_HARD_PROBLEMS_ONLY_SUFFIX = os.getenv("ENABLE_HARD_PROBLEMS_ONLY_SUFFIX", "false").lower() == "true"
+
+
+def is_hard_problem(problem_id: Optional[str]) -> bool:
+    """Return True if the given problem_id is configured as hard.
+
+    When ENABLE_HARD_PROBLEMS_ONLY_SUFFIX is disabled, return True so suffix
+    decoding remains enabled for all problems.
+    """
+    if not ENABLE_HARD_PROBLEMS_ONLY_SUFFIX:
+        return True
+    if problem_id is None:
+        return False
+    return str(problem_id) in HARD_PROBLEMS
+
 
 @contextlib.contextmanager
 def set_shift_parallel_mode(mode: Optional[bool]):
@@ -85,6 +113,48 @@ def is_shift_parallel_mode() -> bool:
     """Check if the shift parallel mode is enabled."""
     global SP_TP_MODE
     return SP_TP_MODE is True
+
+
+# Thread-local storage for problem_ids context
+_problem_id_context = threading.local()
+
+
+class ProblemIdContextManager:
+    """Simple context manager for problem_ids without external dependencies."""
+    
+    @staticmethod
+    def set_current_batch_problem_ids(problem_ids: list[Optional[str]]):
+        """Set problem_ids for the current batch."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        _problem_id_context.data['problem_ids'] = problem_ids
+    
+    @staticmethod
+    def get_problem_id_for_index(index: int) -> Optional[str]:
+        """Get problem_id for a specific index."""
+        if not hasattr(_problem_id_context, 'data'):
+            return None
+        
+        problem_ids = _problem_id_context.data.get('problem_ids', [])
+        if 0 <= index < len(problem_ids):
+            return problem_ids[index]
+        return None
+    
+    @staticmethod
+    def clear_context():
+        """Clear the current context."""
+        if hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+    
+    @staticmethod
+    @contextlib.contextmanager
+    def batch_context(problem_ids: list[Optional[str]]):
+        """Context manager for a batch of problem_ids."""
+        try:
+            ProblemIdContextManager.set_current_batch_problem_ids(problem_ids)
+            yield
+        finally:
+            ProblemIdContextManager.clear_context()
 
 
 class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
@@ -154,6 +224,34 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     "'mlp_speculator' or 'suffix' spec decoding methods.")
             self._suffix_cache = SuffixCache(
                 self.speculative_config.suffix_cache_max_depth)
+            print(f"DEBUG: Initialized suffix cache with max_depth={self.speculative_config.suffix_cache_max_depth}")
+            print(f"DEBUG: ENABLE_HARD_PROBLEMS_ONLY_SUFFIX={ENABLE_HARD_PROBLEMS_ONLY_SUFFIX}")
+            print(f"DEBUG: HARD_PROBLEMS={HARD_PROBLEMS}")
+            # Optionally bootstrap the suffix cache with provided sequences so
+            # that multiple LLM instances can share the same logical suffix tree
+            # contents without passing non-picklable objects across processes.
+# #    ---- Timing buffered writer (to reduce I/O) ----
+        import os as _os
+        import time as _time
+        import atexit as _atexit
+
+        # Buffer config via env with sensible defaults
+        self._timing_buffer: list[dict] = []
+        self._timing_flush_every_n: int = int(_os.getenv("ARCTIC_TIMING_BUFFER_SIZE", "400"))
+        self._timing_flush_every_s: float = float(_os.getenv("ARCTIC_TIMING_FLUSH_SEC", "5"))
+        self._timing_last_flush_time: float = _time.monotonic()
+
+        # Precompute output path for this process
+        output_dir = _os.getenv("ARCTIC_METRICS_DIR", "/tmp/arctic_metrics")
+        _os.makedirs(output_dir, exist_ok=True)
+        local_rank = _os.getenv("LOCAL_RANK", "0")
+        rank = _os.getenv("RANK", "0")
+        self._timing_file_path = _os.path.join(
+            output_dir, f"execution_timing_rank_{rank}_local_{local_rank}.jsonl"
+        )
+
+        # Ensure buffer flushes on process exit
+        _atexit.register(lambda: self._flush_timing_buffer(force=True))
 
     def profile_run(self) -> None:
         self._orig_profile_run()
@@ -221,9 +319,57 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+
+            # Record execution start time for monitoring
+        execution_start_time = time.perf_counter()
+        execution_start_timestamp = datetime.now().isoformat()
+        batch_size = len(self.input_batch.req_ids) if hasattr(self, 'input_batch') and self.input_batch else 0
+
+        # Get process information for data parallel scenarios
+        local_rank = os.getenv("LOCAL_RANK", "0")
+        world_size = os.getenv("WORLD_SIZE", "1")
+        rank = os.getenv("RANK", "0")
+        
+        #Basic execution metrics (before any early returns)
+        basic_metrics = {
+            "timestamp": execution_start_time,
+            "process_info": {
+                "rank": int(rank),
+                "local_rank": int(local_rank),
+                "world_size": int(world_size)
+            },
+            "batch_size": batch_size,
+        }
         self._update_states(scheduler_output)
+        
+        # Extract problem_ids for the current batch at the very beginning
+        problem_ids = []
+        try:
+            if hasattr(self, 'input_batch') and self.input_batch:
+                batch_size = len(self.input_batch.req_ids) if hasattr(self.input_batch, 'req_ids') else 0
+                for i in range(batch_size):
+                    problem_id = self._get_problem_id_for_index(i)
+                    problem_ids.append(problem_id)
+                
+                # Log extracted problem_ids for debugging
+                if any(pid is not None for pid in problem_ids):
+                    logger.info(f"Extracted problem_ids: {problem_ids}")
+                else:
+                    logger.debug("No problem_ids found for current batch")
+        except Exception as e:
+            logger.warning(f"Failed to extract problem_ids: {e}")
+            problem_ids = []
+        
+        # Store problem_ids for potential use throughout the execution
+        self._current_batch_problem_ids = problem_ids
+        
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
+                # # Log early return cases
+                basic_metrics["early_return"] = True    
+                basic_metrics["early_return_reason"] = "no_scheduled_tokens"
+                self._write_metrics(basic_metrics)
+
                 # Return empty ModelRunnerOutput if there's no work to do.
                 return EMPTY_MODEL_RUNNER_OUTPUT
 
@@ -433,17 +579,27 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
 
+        execution_end_time = time.perf_counter()
+        execution_duration = execution_end_time - execution_start_time
+        self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
+                                scheduler_output.total_num_scheduled_tokens)
+
         # NOTE: GPU -> CPU Sync happens here.
-        # Move as many CPU operations as possible before this sync point.
-        logprobs_tensors = sampler_output.logprobs_tensors
+        # Move as many CPU operations as possible before this sync point.===== 50% of time for 1.5B model
+        logprobs_tensors = sampler_output.logprobs_tensors                                
         logprobs_lists = logprobs_tensors.tolists() \
             if logprobs_tensors is not None else None
+
+        
 
         # Compute prompt logprobs if needed.
         prompt_logprobs_dict = self._get_prompt_logprobs_dict(
             hidden_states[:num_scheduled_tokens],
             scheduler_output,
         )
+
+        #========= 100% of time for 1.5B model=====
+
 
         # Get the valid generated tokens.
         sampled_token_ids = sampler_output.sampled_token_ids
@@ -457,10 +613,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 sampled_token_ids,
                 self.input_batch.vocab_size,
             )
+
         # Mask out the sampled tokens that should not be sampled.
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
 
+        #print(f"DEBUG: sampled_token_ids: {sampled_token_ids}")
+            
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         # NOTE(woosuk): As an exception, when using PP, the scheduler sends
@@ -484,6 +643,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             req_id = self.input_batch.req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
+        
+
 
         if self._suffix_cache is not None:
             self._update_suffix_cache(valid_sampled_token_ids)
@@ -503,13 +664,42 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 spec_decode_metadata,
                 attn_metadata,
             )
+            
+            # # # 统计和控制 spec_token 数量
+            if spec_token_ids is not None:
+                # 统计总的 spec_token 数量
+                total_spec_tokens = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
+                
+                # 如果数量超过128，按比例删除一部分
+                if total_spec_tokens > 200:
+                    # 计算需要保留的比例
+                    keep_ratio = 200 / total_spec_tokens
+                    
+                    # 对每个子列表按比例保留 tokens
+                    filtered_spec_token_ids = []
+                    for tokens in spec_token_ids:
+                        if tokens is not None and len(tokens) > 0:
+                            # 计算当前子列表需要保留的数量
+                            keep_count = max(1, int(len(tokens) * keep_ratio))  # 至少保留1个
+                            # 保留前 keep_count 个 tokens
+                            filtered_tokens = tokens[:keep_count]
+                            filtered_spec_token_ids.append(filtered_tokens)
+                        else:
+                            filtered_spec_token_ids.append(tokens)
+                    
+                    spec_token_ids = filtered_spec_token_ids
+                    
+                   # 记录统计信息（可选）
+                    # filtered_total = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
+                    # print(f"Spec tokens reduced: {total_spec_tokens} -> {filtered_total} (ratio: {keep_ratio:.3f})")
+        
+
 
         # Clear KVConnector state after all KVs are generated.
         if has_kv_transfer_group():
             get_kv_transfer_group().clear_connector_metadata()
 
-        self.eplb_step()
-
+        # # self.eplb_step()
         return ModelRunnerOutput(
             req_ids=self.input_batch.req_ids,
             req_id_to_index=self.input_batch.req_id_to_index,
@@ -522,6 +712,102 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             finished_recving=finished_recving,
             num_nans_in_logits=num_nans_in_logits,
         )
+
+    def _get_problem_id_for_index(self, index: int) -> Optional[str]:
+        """Retrieve problem_id for the i-th request if available.
+
+        Sources:
+        - `self.input_batch.problem_id` propagated from rollout layer
+        - Per-request state containers
+        - Fallback: regex extract like "prob_0001" from request id
+        """
+        req_id = None
+        try:
+            req_id = self.input_batch.req_ids[index]
+        except Exception:
+            pass
+
+        # First try context manager (highest priority)
+        try:
+            problem_id = ProblemIdContextManager.get_problem_id_for_index(index)
+            if problem_id is not None:
+                return problem_id
+        except Exception:
+            pass
+
+        # Try input_batch vectorized field first
+        try:
+            problem_ids = getattr(self.input_batch, "problem_id", None)
+            if problem_ids is not None:
+                pid = problem_ids[index]
+                if isinstance(pid, bytes):
+                    pid = pid.decode()
+                # numpy scalar -> python scalar
+                if hasattr(pid, "item"):
+                    pid = pid.item()
+                if isinstance(pid, (list, np.ndarray)):
+                    pid = pid[0] if len(pid) > 0 else None
+                if isinstance(pid, str):
+                    return pid
+        except Exception:
+            pass
+
+        # Try request state attributes
+        try:
+            if req_id is not None and req_id in self.requests:
+                req_state = self.requests[req_id]
+                pid = getattr(req_state, "problem_id", None)
+                if isinstance(pid, bytes):
+                    pid = pid.decode()
+                if isinstance(pid, str):
+                    return pid
+                for container_name in ("inputs", "input", "meta", "meta_info", "request_kwargs", "extra", "extras"):
+                    container = getattr(req_state, container_name, None)
+                    if isinstance(container, dict) and "problem_id" in container:
+                        pid = container.get("problem_id")
+                        if isinstance(pid, bytes):
+                            pid = pid.decode()
+                        if isinstance(pid, str):
+                            return pid
+        except Exception:
+            pass
+
+        # Fallback: extract a common pattern from req_id
+        if req_id is not None:
+            m = re.search(r"(prob_[0-9]{4,})", str(req_id))
+            if m:
+                return m.group(1)
+        return None
+
+    def get_current_batch_problem_ids(self) -> list[Optional[str]]:
+        """
+        Get problem_ids for the current batch that were extracted at the beginning of execute_model.
+        
+        Returns:
+            List of problem_ids for the current batch, with None for requests without problem_ids.
+        """
+        return getattr(self, '_current_batch_problem_ids', [])
+    
+    def get_problem_id_by_request_id(self, req_id: str) -> Optional[str]:
+        """
+        Get problem_id for a specific request ID.
+        
+        Args:
+            req_id: The request ID to look up
+            
+        Returns:
+            The problem_id if found, None otherwise
+        """
+        try:
+            if hasattr(self, 'input_batch') and self.input_batch and hasattr(self.input_batch, 'req_ids'):
+                req_ids = self.input_batch.req_ids
+                if req_id in req_ids:
+                    index = req_ids.index(req_id)
+                    return self._get_problem_id_for_index(index)
+        except Exception as e:
+            logger.debug(f"Failed to get problem_id for request {req_id}: {e}")
+        
+        return None
 
     def propose_draft_token_ids(
         self,
@@ -648,16 +934,28 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             req_id = self.input_batch.req_ids[i]
             seen_req_ids.add(req_id)
 
+            # # Only update suffix cache for hard problems (by problem_id)
+            # problem_id = self._get_problem_id_for_index(i)
+            # if not is_hard_problem(problem_id):
+            #     print(f"DEBUG: Skipping suffix cache update for non-hard problem req_id={req_id}, problem_id={problem_id}")
+            #     continue
+
             if not sampled_ids:
                 continue
 
+            #print(f"DEBUG: Updating suffix cache for hard problem req_id={req_id}, sampled_ids={sampled_ids}")
+            
             index = self.input_batch.req_id_to_index[req_id]
             if not self._suffix_cache.has_cached_prompt(req_id):
                 num_prompt_tokens = self.input_batch.num_prompt_tokens[index]
                 prompt_token_ids = (
                     self.input_batch.token_ids_cpu[index, :num_prompt_tokens])
+                #print(f"DEBUG: Caching prompt for req_id={req_id}, prompt_tokens={num_prompt_tokens}")
                 self._suffix_cache.cache_prompt(req_id, prompt_token_ids)
+            # else:
+            #     print(f"DEBUG: Prompt already cached for req_id={req_id}")
 
+            #print(f"DEBUG: Updating response for req_id={req_id} with {len(sampled_ids)} tokens")
             self._suffix_cache.update_response(req_id, sampled_ids)
 
         # Evict prompts that are not seen
@@ -681,6 +979,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 continue
 
             req_id = self.input_batch.req_ids[i]
+
+            # # Check if this request should use suffix tree decoding
+            # problem_id = self._get_problem_id_for_index(i)
+            # if not is_hard_problem(problem_id):
+            #     print(f"DEBUG: Skipping suffix decoding for non-hard problem req_id={req_id}, problem_id={problem_id}")
+            #     results.append(SuffixSpecResult())
+            #     continue
 
             # Add sampled_token_ids to token_ids_cpu.
             start_idx = self.input_batch.num_tokens_no_spec[i]
@@ -710,6 +1015,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             max_spec_factor = config.suffix_max_spec_factor
             max_spec_offset = (config.suffix_max_spec_offset -
                               len(spec_ids) * (max_spec_factor + 1))
+            #print(f"DEBUG: Before speculation - req_id={req_id}, problem_id={problem_id}, pattern_len={len(pattern)}, pattern_first_10={pattern[:10]}, max_spec_tokens={max_spec_tokens}")
+            #print(f"DEBUG: Suffix cache has_cached_prompt for rproblem_id={problem_id}: {self._suffix_cache.has_cached_prompt(problem_id)}")
+            
             result = self._suffix_cache.speculate(
                 req_id,
                 pattern,
@@ -718,6 +1026,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 max_spec_offset=max_spec_offset,
                 min_token_prob=config.suffix_min_token_prob)
 
+            #print(f"DEBUG: After speculation - req_id={req_id}, result.score={result.score}, result.match_len={result.match_len}, result.token_ids={result.token_ids}")
             results.append(result)
 
         return results
@@ -840,3 +1149,189 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             for mod in self.shift_model.modules():
                 if isinstance(mod, Attention):
                     mod.kv_cache = forward_context[mod.layer_name].kv_cache
+    def _log_execution_time(self, start_timestamp, duration_seconds, batch_size, num_scheduled_tokens):
+        """Log execution time metrics for execute_model calls"""
+        try:
+            timing_data = {
+                "timestamp": start_timestamp,
+                "call_type": "execute_model_timing",
+                "execution_duration_seconds": duration_seconds,
+                "execution_duration_ms": duration_seconds * 1000,
+                "batch_size": batch_size,
+                "num_scheduled_tokens": num_scheduled_tokens,
+                "process_info": {
+                    "rank": int(os.getenv("RANK", "0")),
+                    "local_rank": int(os.getenv("LOCAL_RANK", "0")),
+                    "world_size": int(os.getenv("WORLD_SIZE", "1"))
+                }
+            }
+            
+            # Write to file
+            self._write_timing_stats(timing_data)
+            
+        except Exception as e:
+            # Log error but don't crash the model
+            logger.error(f"Failed to log execution time: {e}")
+    
+    def _write_timing_stats(self, timing_data):
+        """Buffer execution timing data and flush periodically to reduce I/O."""
+        try:
+            # Enqueue timing data
+            self._timing_buffer.append(json.dumps(timing_data, default=self._json_serializable))
+
+            # Flush conditions: buffer size or time threshold
+            should_flush_by_n = len(self._timing_buffer) >= self._timing_flush_every_n
+            if should_flush_by_n:
+                self._flush_timing_buffer()
+        except Exception as e:
+            logger.error(f"Failed to buffer timing stats: {e}")
+
+    def _flush_timing_buffer(self, force: bool = False):
+        """Flush buffered timing lines to disk.
+
+        When force is True, flush unconditionally (e.g., at exit).
+        """
+        try:
+            if not self._timing_buffer and not force:
+                return
+            # Nothing to write if empty and not forced
+            if not self._timing_buffer:
+                self._timing_last_flush_time = time.monotonic()
+                return
+
+            # Write all pending lines at once
+            with open(self._timing_file_path, "a") as f:
+                f.write("\n".join(self._timing_buffer) + "\n")
+            self._timing_buffer.clear()
+            self._timing_last_flush_time = time.monotonic()
+        except Exception as e:
+            logger.error(f"Failed to flush timing stats: {e}")
+
+    
+    def _json_serializable(self, obj):
+        """Convert numpy types and other non-serializable objects to JSON-serializable types"""
+        import numpy as np
+        if isinstance(obj, (np.integer, np.int32, np.int64)):
+            return int(obj)
+        elif isinstance(obj, (np.floating, np.float32, np.float64)):
+            return float(obj)
+        elif isinstance(obj, np.ndarray):
+            return obj.tolist()
+        elif hasattr(obj, 'item'):  # Handle scalar numpy types
+            return obj.item()
+        else:
+            return str(obj)  # Fallback to string representation
+    
+    def _log_suffix_tree_stats(self, valid_sampled_token_ids, sampled_token_ids, discard_sampled_tokens_req_indices):
+        """Log suffix tree decoding statistics for this execute_model call"""
+        if not hasattr(self, 'input_batch') or not self.input_batch:
+            return
+        
+        # Count total proposed and accepted tokens for this call
+        total_proposed = 0
+        total_accepted = 0
+        per_request_stats = []
+        
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            proposed_count = 0
+            accepted_count = 0
+            
+            # Count proposed spec tokens for this request
+            if i < len(sampled_token_ids) and len(valid_sampled_token_ids[i]) > 0 and i not in discard_sampled_tokens_req_indices:
+                # Handle both tensor and list cases
+                sampled_tokens = sampled_token_ids[i]
+                if hasattr(sampled_tokens, 'numel'):  # It's a tensor
+                    if sampled_tokens.numel() > 0:  # Check if tensor is non-empty
+                        # Count non-padding tokens (exclude -1 padding)
+                        non_padding_count = (sampled_tokens != -1).sum().item()
+                        proposed_count = max(0, non_padding_count - 1)  # Subtract 1 for the normal generated token
+                        total_proposed += proposed_count
+                elif sampled_tokens:  # It's a list or other sequence
+                    # Count non-padding tokens (exclude -1 padding)
+                    non_padding_count = sum(1 for token in sampled_tokens if token != -1)
+                    proposed_count = max(0, non_padding_count - 1)  # Subtract 1 for the normal generated token
+                    total_proposed += proposed_count 
+                
+                # Count accepted spec tokens (tokens beyond the first one in valid_sampled_token_ids)
+                if i < len(valid_sampled_token_ids) and len(valid_sampled_token_ids[i]) > 0 and i not in discard_sampled_tokens_req_indices:
+                    valid_tokens = valid_sampled_token_ids[i]
+                    if hasattr(valid_tokens, 'numel'):  # It's a tensor
+                        if valid_tokens.numel() > 0:
+                            # Count non-padding tokens (exclude -1 padding)
+                            non_padding_accepted = (valid_tokens != -1).sum().item()
+                            # The first token is always the normal generated token
+                            # Additional tokens are the accepted spec tokens
+                            accepted_count = max(0, non_padding_accepted - 1)
+                            total_accepted += accepted_count
+                    elif valid_tokens:  # It's a list or other sequence
+                        # Count non-padding tokens (exclude -1 padding)
+                        non_padding_accepted = sum(1 for token in valid_tokens if token != -1)
+                        # The first token is always the normal generated token
+                        # Additional tokens are the accepted spec tokens
+                        accepted_count = max(0, non_padding_accepted - 1)
+                        total_accepted += accepted_count
+            
+            # Record per-request stats
+            per_request_stats.append({
+                "req_id": req_id,
+                "proposed": proposed_count,
+                "accepted": accepted_count
+            })
+        
+        # Add debug info for first few calls
+        if hasattr(self, '_debug_call_count'):
+            self._debug_call_count += 1
+        else:
+            self._debug_call_count = 1
+            
+        # Log debug info for first few calls
+        if self._debug_call_count <= 5 and len(sampled_token_ids) > 0:
+            sample_tokens = sampled_token_ids[0] if len(sampled_token_ids) > 0 else []
+            if hasattr(sample_tokens, 'tolist'):
+                sample_tokens = sample_tokens.tolist()
+            print(f"DEBUG Call {self._debug_call_count}: sampled_tokens[0] = {sample_tokens[:20]}... (showing first 20)")
+            print(f"DEBUG Call {self._debug_call_count}: total_proposed = {total_proposed}, total_accepted = {total_accepted}")
+
+        # Only log if there were spec tokens proposed
+        if total_proposed > 0:
+            stats_data = {
+                "timestamp": datetime.now().isoformat(),
+                "call_type": "execute_model_suffix_tree",
+                "batch_size": len(self.input_batch.req_ids),
+                "total_proposed": total_proposed,
+                "total_accepted": total_accepted,
+                "accept_rate": total_accepted / total_proposed * 100 if total_proposed > 0 else 0,
+                "per_request_stats": per_request_stats,
+                "process_info": {
+                    "rank": int(os.getenv("RANK", "0")),
+                    "local_rank": int(os.getenv("LOCAL_RANK", "0")),
+                    "world_size": int(os.getenv("WORLD_SIZE", "1"))
+                }
+            }
+            
+            # Write to file
+            self._write_suffix_tree_stats(stats_data)
+    
+    def _write_suffix_tree_stats(self, stats_data):
+        """Write suffix tree decoding statistics to file with conflict avoidance"""
+        try:
+            # Use environment variable for output directory
+            output_dir = os.getenv("ARCTIC_METRICS_DIR", "/app/src")
+            os.makedirs(output_dir, exist_ok=True)
+            
+            # Get process info for filename
+            local_rank = os.getenv("LOCAL_RANK", "0")
+            rank = os.getenv("RANK", "0")
+            
+            # Create separate files for each process to avoid conflicts
+            stats_file = os.path.join(output_dir, f"suffix_tree_stats_rank_{rank}_local_{local_rank}.jsonl")
+            
+            # Write with immediate flush to ensure data is written atomically
+            with open(stats_file, "a") as f:
+                f.write(json.dumps(stats_data, default=self._json_serializable) + "\n")
+                f.flush()  # Force immediate write to disk
+                os.fsync(f.fileno())  # Force OS to write to storage
+                
+        except Exception as e:
+            # Log error but don't crash the model
+            logger.error(f"Failed to write suffix tree stats: {e}")

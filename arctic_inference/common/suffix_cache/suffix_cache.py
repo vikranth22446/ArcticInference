@@ -154,7 +154,7 @@ class SuffixCache:
         pattern: Sequence[int],
         max_spec_tokens: Optional[int] = None,
         max_spec_factor: float = 1.0,
-        max_spec_offset: float = 0.0,
+        max_spec_offset: float = -1,
         min_token_prob: float = 0.1,
         use_tree_spec: bool = False,
         use_cached_prompt: bool = True,
@@ -191,11 +191,15 @@ class SuffixCache:
         if not pattern:
             raise ValueError("Pattern must not be empty")
 
+
         if max_spec_tokens is None:
             max_spec_tokens = self.max_depth
+        max_spec_tokens = 10
+        max_spec_offset = -1
 
         if len(pattern) > self._max_depth:
             pattern = pattern[-self._max_depth :]
+        
 
         if use_cached_prompt:
             prompt_tree = self._prompt_trees[req_id]

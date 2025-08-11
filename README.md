@@ -127,14 +127,11 @@ from vllm import LLM, SamplingParams
 vllm.plugins.load_general_plugins()
 
 llm = LLM(
-    model="Snowflake/Llama-3.1-SwiftKV-8B-Instruct",
-    quantization="fp8",
+    model="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
     tensor_parallel_size=1,
-    ulysses_sequence_parallel_size=2,
-    enable_shift_parallel=True,
+    ulysses_sequence_parallel_size=1,
     speculative_config={
-        "method": "arctic",
-        "model": "Snowflake/Arctic-LSTM-Speculator-Llama-3.1-8B-Instruct",
+        "method": "suffix",
         "num_speculative_tokens": 3,
         "enable_suffix_decoding": True,
         "disable_by_batch_size": 64,

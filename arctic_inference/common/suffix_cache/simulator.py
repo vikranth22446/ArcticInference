@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+#python ArcticInference/arctic_inference/common/suffix_cache/simulator.py /app/src/rllm/data/rollout_data/deepscaler_1.5b/hard20_16k__n8_0/1.jsonl  --tokenizer deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --format jsonl --train-dataset /app/src/rllm/data/rollout_data/deepscaler_1.5b/hard20_16k__n8_2/1.jsonl --output /app/src/outputs 
 import argparse
 import itertools
 import multiprocessing as mp
@@ -184,7 +185,7 @@ def process_task(
             request_id,
             example["prompt"],
             example["response"],
-            max_depth,
+            max_spec_tokens,
             max_spec_factor=max_spec_factor,
             min_token_prob=min_token_prob,
             use_tree_spec=use_tree_spec,
@@ -245,7 +246,7 @@ def results_summary(df: pd.DataFrame, config_cols: List[str]) -> pd.DataFrame:
         "sum_out_toks",
         "sum_spec_ms",
         "sum_update_ms"])
-    return summary.drop(columns=drop_cols).set_index("task_id")
+    return summary.drop(columns=drop_cols)
 
 
 def read_data_file(
@@ -255,6 +256,7 @@ def read_data_file(
     format: Optional[str] = None,
 ) -> pd.DataFrame:
     # Read the dataset file into a pandas DataFrame.
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     if format is None:
         _, ext = os.path.splitext(path)
         format = ext[1:]
@@ -263,7 +265,29 @@ def read_data_file(
     elif format == "json":
         df = pd.read_json(path)
     elif format == "jsonl":
-        df = pd.read_json(path, lines=True)
+        # Prefer pandas for performance, but fall back to a precise parser with
+        # clearer errors when files are empty or contain malformed lines.
+        try:
+            df = pd.read_json(path, lines=True)
+        except ValueError as e:
+            # Handle empty files or lines with stray whitespace/comments
+            import json
+            lines: List[str] = []
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped:
+                        lines.append(stripped)
+            if not lines:
+                raise ValueError(f"Dataset file is empty: {path}") from e
+            records: List[Dict] = []
+            for i, line in enumerate(lines, start=1):
+                try:
+                    records.append(json.loads(line))
+                except Exception as je:
+                    raise ValueError(
+                        f"Invalid JSONL content at {path}:{i}: {je}") from je
+            df = pd.DataFrame.from_records(records)
     else:
         raise ValueError(f"Unsupported dataset format: {format}")
     # Ensure that the prompt and response columns are present in the dataset.
@@ -413,13 +437,13 @@ def get_parser():
     parser.add_argument(
         "--prompt-column",
         type=str,
-        default="prompt",
+        default="input",
         help="Column name for the prompts in the dataset",
     )
     parser.add_argument(
         "--response-column",
         type=str,
-        default="response",
+        default="output",
         help="Column name for the responses in the dataset",
     )
     parser.add_argument(

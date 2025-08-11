@@ -14,6 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass
+from typing import List, Optional, Sequence
 import logging
 
 from vllm.config import ParallelConfig, SpeculativeConfig, VllmConfig
@@ -60,6 +61,11 @@ class ArcticSpeculativeConfig(SpeculativeConfig):
     suffix_max_spec_factor: float = 1.0
     suffix_max_spec_offset: float = 0.0
     suffix_min_token_prob: float = 0.1
+    # Optional bootstrap data to seed the suffix cache when the engine starts.
+    # Provide a list of token-id sequences; each sequence will be inserted as a
+    # separate historical response stream so newly created engines can reuse
+    # the same logical suffix tree content.
+    suffix_cache_bootstrap: Optional[List[Sequence[int]]] = None
 
 
 class ParallelConfigPatch(ArcticPatch[ParallelConfig]):
