@@ -17,7 +17,8 @@ import contextlib
 import copy
 import time
 import threading
-from typing import Any, Union, Optional, TYPE_CHECKING
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Union, Optional, TYPE_CHECKING, Hashable
 from itertools import tee
 from datetime import datetime
 import os
@@ -231,27 +232,27 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # that multiple LLM instances can share the same logical suffix tree
             # contents without passing non-picklable objects across processes.
 # #    ---- Timing buffered writer (to reduce I/O) ----
-        import os as _os
-        import time as _time
-        import atexit as _atexit
+        # import os as _os
+        # import time as _time
+        # import atexit as _atexit
 
-        # Buffer config via env with sensible defaults
-        self._timing_buffer: list[dict] = []
-        self._timing_flush_every_n: int = int(_os.getenv("ARCTIC_TIMING_BUFFER_SIZE", "400"))
-        self._timing_flush_every_s: float = float(_os.getenv("ARCTIC_TIMING_FLUSH_SEC", "5"))
-        self._timing_last_flush_time: float = _time.monotonic()
+        # # Buffer config via env with sensible defaults
+        # self._timing_buffer: list[dict] = []
+        # self._timing_flush_every_n: int = int(_os.getenv("ARCTIC_TIMING_BUFFER_SIZE", "400"))
+        # self._timing_flush_every_s: float = float(_os.getenv("ARCTIC_TIMING_FLUSH_SEC", "5"))
+        # self._timing_last_flush_time: float = _time.monotonic()
 
-        # Precompute output path for this process
-        output_dir = _os.getenv("ARCTIC_METRICS_DIR", "/tmp/arctic_metrics")
-        _os.makedirs(output_dir, exist_ok=True)
-        local_rank = _os.getenv("LOCAL_RANK", "0")
-        rank = _os.getenv("RANK", "0")
-        self._timing_file_path = _os.path.join(
-            output_dir, f"execution_timing_rank_{rank}_local_{local_rank}.jsonl"
-        )
+        # # Precompute output path for this process
+        # output_dir = _os.getenv("ARCTIC_METRICS_DIR", "/tmp/arctic_metrics")
+        # _os.makedirs(output_dir, exist_ok=True)
+        # local_rank = _os.getenv("LOCAL_RANK", "0")
+        # rank = _os.getenv("RANK", "0")
+        # self._timing_file_path = _os.path.join(
+        #     output_dir, f"execution_timing_rank_{rank}_local_{local_rank}.jsonl"
+        # )
 
-        # Ensure buffer flushes on process exit
-        _atexit.register(lambda: self._flush_timing_buffer(force=True))
+        # # Ensure buffer flushes on process exit
+        # _atexit.register(lambda: self._flush_timing_buffer(force=True))
 
     def profile_run(self) -> None:
         self._orig_profile_run()
@@ -320,26 +321,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
 
-            # Record execution start time for monitoring
-        execution_start_time = time.perf_counter()
-        execution_start_timestamp = datetime.now().isoformat()
-        batch_size = len(self.input_batch.req_ids) if hasattr(self, 'input_batch') and self.input_batch else 0
-
         # Get process information for data parallel scenarios
         local_rank = os.getenv("LOCAL_RANK", "0")
         world_size = os.getenv("WORLD_SIZE", "1")
         rank = os.getenv("RANK", "0")
         
-        #Basic execution metrics (before any early returns)
-        basic_metrics = {
-            "timestamp": execution_start_time,
-            "process_info": {
-                "rank": int(rank),
-                "local_rank": int(local_rank),
-                "world_size": int(world_size)
-            },
-            "batch_size": batch_size,
-        }
         self._update_states(scheduler_output)
         
         # Extract problem_ids for the current batch at the very beginning
@@ -365,20 +351,15 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
-                # # Log early return cases
-                basic_metrics["early_return"] = True    
-                basic_metrics["early_return_reason"] = "no_scheduled_tokens"
-                self._write_metrics(basic_metrics)
-
-                # Return empty ModelRunnerOutput if there's no work to do.
                 return EMPTY_MODEL_RUNNER_OUTPUT
-
             return self.kv_connector_no_forward(scheduler_output)
 
         # Prepare the decoder inputs.
         (attn_metadata, attention_cuda_graphs, logits_indices,
          spec_decode_metadata,
          num_scheduled_tokens_np) = (self._prepare_inputs(scheduler_output))
+        batch_size = len(self.input_batch.req_ids) if hasattr(self, 'input_batch') and self.input_batch else 0
+
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         use_shift_model = (
             self.use_ulysses and self.shift_model is not None and
@@ -469,6 +450,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         ):
             self.maybe_setup_kv_connector(scheduler_output)
 
+            # Record GPU execution start time for monitoring
+            # torch.cuda.synchronize()
+            # execution_start_time = time.perf_counter()
+            # execution_start_timestamp = datetime.now().isoformat()
+            
             model = self.shift_model if use_shift_model else self.model
             with set_shift_parallel_mode(use_shift_model):
                 model_output = model(
@@ -557,6 +543,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             )
             sampler_output.sampled_token_ids = output_token_ids
 
+        # Record GPU execution end time after all GPU computations are complete
+        # torch.cuda.synchronize()
+        # execution_end_time = time.perf_counter()
+        # execution_duration = execution_end_time - execution_start_time
+        # self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
+        #                         scheduler_output.total_num_scheduled_tokens, early_return=False)
+
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             num_nans_in_logits = self._get_nans_in_logits(logits)
@@ -579,13 +572,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 # so that we could clear the sampled tokens before returning.
                 discard_sampled_tokens_req_indices.append(i)
 
-        execution_end_time = time.perf_counter()
-        execution_duration = execution_end_time - execution_start_time
-        self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
-                                scheduler_output.total_num_scheduled_tokens)
 
         # NOTE: GPU -> CPU Sync happens here.
-        # Move as many CPU operations as possible before this sync point.===== 50% of time for 1.5B model
+        # Move as many CPU operations as possible before this sync point.
         logprobs_tensors = sampler_output.logprobs_tensors                                
         logprobs_lists = logprobs_tensors.tolists() \
             if logprobs_tensors is not None else None
@@ -643,11 +632,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             req_id = self.input_batch.req_ids[req_idx]
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
-        
 
 
         if self._suffix_cache is not None:
             self._update_suffix_cache(valid_sampled_token_ids)
+        # torch.cuda.synchronize()
+        # execution_start_time = time.perf_counter()
+        # execution_start_timestamp = datetime.now().isoformat()
+        
 
         if not self.speculative_config:
             # Speculative decoding is not enabled.
@@ -692,7 +684,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                    # 记录统计信息（可选）
                     # filtered_total = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
                     # print(f"Spec tokens reduced: {total_spec_tokens} -> {filtered_total} (ratio: {keep_ratio:.3f})")
-        
+        # execution_end_time = time.perf_counter()
+        # execution_duration = execution_end_time - execution_start_time
+        # self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
+        #                         scheduler_output.total_num_scheduled_tokens, early_return=False)
+
 
 
         # Clear KVConnector state after all KVs are generated.
@@ -890,12 +886,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         return spec_token_ids
 
-    def propose_arctic_draft_token_ids(
+
+    def _propose_arctic_draft_token_ids(
         self,
         scheduler_output: "SchedulerOutput",
         sampled_token_ids: list[list[int]],
         previous_hidden_states: Optional[torch.Tensor] = None,
     ) -> list[list[int]]:
+        """Original serial implementation for fallback."""
         last_tokens : list[int] = []
         for i, sampled_ids in enumerate(sampled_token_ids):
             num_sampled_ids = len(sampled_ids)
@@ -969,65 +967,69 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         spec_token_ids: Optional[list[list[int]]] = None,
     ) -> list[list[int]]:
         config = self.speculative_config
-        results = []
+        # Pre-allocate results with defaults for empty inputs
+        results: list[SuffixSpecResult] = [SuffixSpecResult() for _ in sampled_token_ids]
+
+        # First pass: update token buffer and prepare speculate arguments to avoid
+        # concurrent writes into shared buffers.
+        tasks: list[tuple[int, Hashable, list[int], int, float, float, float]] = []
         for i, sampled_ids in enumerate(sampled_token_ids):
             spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
             num_sampled_ids = len(sampled_ids)
             if not num_sampled_ids:
-                # Skip speculative decoding.
-                results.append(SuffixSpecResult())
                 continue
 
             req_id = self.input_batch.req_ids[i]
 
-            # # Check if this request should use suffix tree decoding
-            # problem_id = self._get_problem_id_for_index(i)
-            # if not is_hard_problem(problem_id):
-            #     print(f"DEBUG: Skipping suffix decoding for non-hard problem req_id={req_id}, problem_id={problem_id}")
-            #     results.append(SuffixSpecResult())
-            #     continue
-
             # Add sampled_token_ids to token_ids_cpu.
             start_idx = self.input_batch.num_tokens_no_spec[i]
-            end_idx = start_idx + len(sampled_ids)
+            end_idx = start_idx + num_sampled_ids
             self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
 
             size = min(end_idx, config.suffix_cache_max_depth)
-            pattern = self.input_batch.token_ids_cpu[i, end_idx-size:end_idx]
-            pattern = pattern.tolist() + spec_ids
+            base_segment = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx]
+            pattern = base_segment.tolist() + spec_ids
             if len(pattern) > config.suffix_cache_max_depth:
                 pattern = pattern[-config.suffix_cache_max_depth:]
-            max_spec_tokens = min(MAX_SPEC_LEN - len(spec_ids),
-                                  config.suffix_cache_max_depth,
-                                  self.max_model_len - end_idx - 1)
-            # max_spec_offset is modified to mimic the behavior of the original
-            # max_spec_factor and max_spec_offset as if the speculative tokens
-            # were generated by suffix decoding. For example, if:
-            #   - max_spec_factor = 2
-            #   - max_spec_offset = -1
-            #   - we've already speculated 3 tokens
-            #   - and the suffix match length is 6
-            # Then:
-            #   - The match length before the already-speculated tokens is 3
-            #   - The original config allow up to 5 speculated tokens total
-            #   - Already speculated 3 tokens, so should allow 2 more tokens
-            # So the new config should map match length 6 to 2 max spec tokens.
+
+            max_spec_tokens = min(
+                MAX_SPEC_LEN - len(spec_ids),
+                config.suffix_cache_max_depth,
+                self.max_model_len - end_idx - 1,
+            )
             max_spec_factor = config.suffix_max_spec_factor
-            max_spec_offset = (config.suffix_max_spec_offset -
-                              len(spec_ids) * (max_spec_factor + 1))
-            #print(f"DEBUG: Before speculation - req_id={req_id}, problem_id={problem_id}, pattern_len={len(pattern)}, pattern_first_10={pattern[:10]}, max_spec_tokens={max_spec_tokens}")
-            #print(f"DEBUG: Suffix cache has_cached_prompt for rproblem_id={problem_id}: {self._suffix_cache.has_cached_prompt(problem_id)}")
-            
+            max_spec_offset = (
+                config.suffix_max_spec_offset - len(spec_ids) * (max_spec_factor + 1)
+            )
+
+            tasks.append(
+                (
+                    i,
+                    req_id,
+                    pattern,
+                    max_spec_tokens,
+                    max_spec_factor,
+                    max_spec_offset,
+                    config.suffix_min_token_prob,
+                )
+            )
+
+        def _speculate_one(task: tuple[int, Hashable, list[int], int, float, float, float]):
+            idx, req_id, pattern, max_spec_tokens, max_spec_factor, max_spec_offset, min_token_prob = task
             result = self._suffix_cache.speculate(
                 req_id,
                 pattern,
                 max_spec_tokens=max_spec_tokens,
                 max_spec_factor=max_spec_factor,
                 max_spec_offset=max_spec_offset,
-                min_token_prob=config.suffix_min_token_prob)
+                min_token_prob=min_token_prob,
+            )
+            return idx, result
 
-            #print(f"DEBUG: After speculation - req_id={req_id}, result.score={result.score}, result.match_len={result.match_len}, result.token_ids={result.token_ids}")
-            results.append(result)
+        if tasks:
+            with ThreadPoolExecutor() as executor:
+                for idx, result in executor.map(_speculate_one, tasks):
+                    results[idx] = result
 
         return results
 
@@ -1149,7 +1151,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             for mod in self.shift_model.modules():
                 if isinstance(mod, Attention):
                     mod.kv_cache = forward_context[mod.layer_name].kv_cache
-    def _log_execution_time(self, start_timestamp, duration_seconds, batch_size, num_scheduled_tokens):
+    def _log_execution_time(self, start_timestamp, duration_seconds, batch_size, num_scheduled_tokens,early_return=False):
         """Log execution time metrics for execute_model calls"""
         try:
             timing_data = {
@@ -1163,7 +1165,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     "rank": int(os.getenv("RANK", "0")),
                     "local_rank": int(os.getenv("LOCAL_RANK", "0")),
                     "world_size": int(os.getenv("WORLD_SIZE", "1"))
-                }
+                },
+                "early_return": early_return
             }
             
             # Write to file
