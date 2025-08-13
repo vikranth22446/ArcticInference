@@ -450,7 +450,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         ):
             self.maybe_setup_kv_connector(scheduler_output)
 
-            # Record GPU execution start time for monitoring
+            ### Record GPU execution start time for monitoring
             # torch.cuda.synchronize()
             # execution_start_time = time.perf_counter()
             # execution_start_timestamp = datetime.now().isoformat()
@@ -543,7 +543,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             )
             sampler_output.sampled_token_ids = output_token_ids
 
-        # Record GPU execution end time after all GPU computations are complete
+        #### Record GPU execution end time after all GPU computations are complete
         # torch.cuda.synchronize()
         # execution_end_time = time.perf_counter()
         # execution_duration = execution_end_time - execution_start_time
@@ -587,8 +587,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             scheduler_output,
         )
 
-        #========= 100% of time for 1.5B model=====
-
 
         # Get the valid generated tokens.
         sampled_token_ids = sampler_output.sampled_token_ids
@@ -606,6 +604,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # Mask out the sampled tokens that should not be sampled.
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
+
+        ### profiling suffix_tree_stats: now may have bug 
+        #self._log_suffix_tree_stats(valid_sampled_token_ids, sampled_token_ids, discard_sampled_tokens_req_indices)
 
         #print(f"DEBUG: sampled_token_ids: {sampled_token_ids}")
             
@@ -636,6 +637,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         if self._suffix_cache is not None:
             self._update_suffix_cache(valid_sampled_token_ids)
+
+
+        ### profiling suffix tree decoding
         # torch.cuda.synchronize()
         # execution_start_time = time.perf_counter()
         # execution_start_timestamp = datetime.now().isoformat()
