@@ -121,7 +121,7 @@ _problem_id_context = threading.local()
 
 
 class ProblemIdContextManager:
-    """Simple context manager for problem_ids without external dependencies."""
+    """Context manager for problem_ids with req_id mapping support."""
     
     @staticmethod
     def set_current_batch_problem_ids(problem_ids: list[Optional[str]]):
@@ -131,21 +131,57 @@ class ProblemIdContextManager:
         _problem_id_context.data['problem_ids'] = problem_ids
     
     @staticmethod
-    def get_problem_id_for_index(index: int) -> Optional[str]:
-        """Get problem_id for a specific index."""
+    def get_current_batch_problem_ids() -> list[Optional[str]]:
+        """Get problem_ids for the current batch."""
+        if not hasattr(_problem_id_context, 'data'):
+            return []
+        return _problem_id_context.data.get('problem_ids', [])
+    
+    @staticmethod
+    def set_req_id_to_problem_id_mapping(mapping: dict[str, Optional[str]]):
+        """Set req_id to problem_id mapping."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        _problem_id_context.data['req_id_to_problem_id'] = mapping
+    
+    @staticmethod
+    def get_req_id_to_problem_id_mapping() -> dict[str, Optional[str]]:
+        """Get the req_id to problem_id mapping."""
+        if not hasattr(_problem_id_context, 'data'):
+            return {}
+        return _problem_id_context.data.get('req_id_to_problem_id', {})
+    
+    # @staticmethod
+    # def get_problem_id_for_index(index: int) -> Optional[str]:
+    #     """Get problem_id for a specific index."""
+    #     if not hasattr(_problem_id_context, 'data'):
+    #         return None
+        
+    #     problem_ids = _problem_id_context.data.get('problem_ids', [])
+    #     if 0 <= index < len(problem_ids):
+    #         return problem_ids[index]
+    #     return None
+    
+    @staticmethod
+    def get_problem_id_for_req_id(req_id: str) -> Optional[str]:
+        """Get problem_id for a specific req_id."""
         if not hasattr(_problem_id_context, 'data'):
             return None
         
-        problem_ids = _problem_id_context.data.get('problem_ids', [])
-        if 0 <= index < len(problem_ids):
-            return problem_ids[index]
-        return None
+        mapping = _problem_id_context.data.get('req_id_to_problem_id', {})
+        return mapping.get(req_id)
     
     @staticmethod
     def clear_context():
         """Clear the current context."""
         if hasattr(_problem_id_context, 'data'):
             _problem_id_context.data = {}
+    
+    @staticmethod
+    def clear_req_id_mapping():
+        """Clear only the req_id mapping, keep problem_ids."""
+        if hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data.pop('req_id_to_problem_id', None)
     
     @staticmethod
     @contextlib.contextmanager
@@ -156,6 +192,58 @@ class ProblemIdContextManager:
             yield
         finally:
             ProblemIdContextManager.clear_context()
+
+
+def extract_problem_id_from_prompt(prompt) -> Optional[str]:
+    """Extract problem_id from a prompt object.
+    
+    This function should be customized based on how problem_id is embedded in prompts.
+    Current implementation supports vLLMRollout's prompt format.
+    """
+    try:
+        # Method 1: Direct problem_id field in dict (vLLMRollout format)
+        if isinstance(prompt, dict) and 'problem_id' in prompt:
+            return prompt['problem_id']
+        
+        # Method 2: If prompt is a dict with prompt_token_ids and problem_id fields
+        if isinstance(prompt, dict):
+            # Check for vLLM input format: {"prompt_token_ids": [...], "problem_id": "..."}
+            if 'problem_id' in prompt:
+                return prompt['problem_id']
+            
+            # Check for meta field containing problem_id
+            if 'meta' in prompt:
+                meta = prompt['meta']
+                if isinstance(meta, dict) and 'problem_id' in meta:
+                    return meta['problem_id']
+        
+        # Method 3: If prompt string contains problem_id pattern
+        if isinstance(prompt, str):
+            import re
+            # Pattern: problem_id:value
+            match = re.search(r'problem_id:(\w+)', prompt)
+            if match:
+                return match.group(1)
+            
+            # Pattern: [PROBLEM_ID: value]
+            match = re.search(r'\[PROBLEM_ID:\s*(\w+)\]', prompt)
+            if match:
+                return match.group(1)
+        
+        # Method 4: Handle TextPrompt or other prompt types
+        if hasattr(prompt, 'problem_id'):
+            return prompt.problem_id
+        
+        # Method 5: Handle nested structures
+        if hasattr(prompt, 'get'):
+            return prompt.get('problem_id')
+            
+        return None
+    except Exception:
+        return None
+
+
+
 
 
 class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
@@ -232,27 +320,27 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # that multiple LLM instances can share the same logical suffix tree
             # contents without passing non-picklable objects across processes.
 # #    ---- Timing buffered writer (to reduce I/O) ----
-        # import os as _os
-        # import time as _time
-        # import atexit as _atexit
+        import os as _os
+        import time as _time
+        import atexit as _atexit
 
-        # # Buffer config via env with sensible defaults
-        # self._timing_buffer: list[dict] = []
-        # self._timing_flush_every_n: int = int(_os.getenv("ARCTIC_TIMING_BUFFER_SIZE", "400"))
-        # self._timing_flush_every_s: float = float(_os.getenv("ARCTIC_TIMING_FLUSH_SEC", "5"))
-        # self._timing_last_flush_time: float = _time.monotonic()
+        # Buffer config via env with sensible defaults
+        self._timing_buffer: list[dict] = []
+        self._timing_flush_every_n: int = int(_os.getenv("ARCTIC_TIMING_BUFFER_SIZE", "400"))
+        self._timing_flush_every_s: float = float(_os.getenv("ARCTIC_TIMING_FLUSH_SEC", "5"))
+        self._timing_last_flush_time: float = _time.monotonic()
 
-        # # Precompute output path for this process
-        # output_dir = _os.getenv("ARCTIC_METRICS_DIR", "/tmp/arctic_metrics")
-        # _os.makedirs(output_dir, exist_ok=True)
-        # local_rank = _os.getenv("LOCAL_RANK", "0")
-        # rank = _os.getenv("RANK", "0")
-        # self._timing_file_path = _os.path.join(
-        #     output_dir, f"execution_timing_rank_{rank}_local_{local_rank}.jsonl"
-        # )
+        # Precompute output path for this process
+        output_dir = _os.getenv("ARCTIC_METRICS_DIR", "/tmp/arctic_metrics")
+        _os.makedirs(output_dir, exist_ok=True)
+        local_rank = _os.getenv("LOCAL_RANK", "0")
+        rank = _os.getenv("RANK", "0")
+        self._timing_file_path = _os.path.join(
+            output_dir, f"execution_timing_rank_{rank}_local_{local_rank}.jsonl"
+        )
 
-        # # Ensure buffer flushes on process exit
-        # _atexit.register(lambda: self._flush_timing_buffer(force=True))
+        # Ensure buffer flushes on process exit
+        _atexit.register(lambda: self._flush_timing_buffer(force=True))
 
     def profile_run(self) -> None:
         self._orig_profile_run()
@@ -329,25 +417,38 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self._update_states(scheduler_output)
         
         # Extract problem_ids for the current batch at the very beginning
-        problem_ids = []
-        try:
-            if hasattr(self, 'input_batch') and self.input_batch:
-                batch_size = len(self.input_batch.req_ids) if hasattr(self.input_batch, 'req_ids') else 0
-                for i in range(batch_size):
-                    problem_id = self._get_problem_id_for_index(i)
-                    problem_ids.append(problem_id)
-                
-                # Log extracted problem_ids for debugging
-                if any(pid is not None for pid in problem_ids):
-                    logger.info(f"Extracted problem_ids: {problem_ids}")
-                else:
-                    logger.debug("No problem_ids found for current batch")
-        except Exception as e:
-            logger.warning(f"Failed to extract problem_ids: {e}")
-            problem_ids = []
+        # Build req_id to problem_id mapping for the current batch
+        self._current_batch_req_id_to_problem_id = {}
+        self._current_batch_problem_ids = []
         
-        # Store problem_ids for potential use throughout the execution
-        self._current_batch_problem_ids = problem_ids
+        if hasattr(self.input_batch, 'req_ids') and self.input_batch.req_ids:
+            batch_size = len(self.input_batch.req_ids)
+            
+            # Build mapping from req_id to problem_id
+            # Get req_id to problem_id mapping from LLM patches (most reliable)
+            context_mapping = ProblemIdContextManager.get_req_id_to_problem_id_mapping()
+            #print(f"DEBUG: context_mapping: {context_mapping}")
+            
+            for i, req_id in enumerate(self.input_batch.req_ids):
+                problem_id = None
+                
+                # Method 1: Use mapping from LLM patches (most reliable)
+                if req_id in context_mapping:
+                    problem_id = context_mapping[req_id]
+                
+                # Method 2: Fallback to context manager index lookup
+                if problem_id is None:
+                    pass
+                    #print(f"DEBUG: problem_id is None for req_id {req_id}")
+                
+                self._current_batch_req_id_to_problem_id[req_id] = problem_id
+                self._current_batch_problem_ids.append(problem_id)
+                
+            # Log the mapping for debugging (optional)
+            # print(f"DEBUG: execute_model batch mapping: {self._current_batch_req_id_to_problem_id}")
+        else:
+            batch_size = 0
+
         
         if not scheduler_output.total_num_scheduled_tokens:
             if not has_kv_transfer_group():
@@ -451,9 +552,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             self.maybe_setup_kv_connector(scheduler_output)
 
             ### Record GPU execution start time for monitoring
-            # torch.cuda.synchronize()
-            # execution_start_time = time.perf_counter()
-            # execution_start_timestamp = datetime.now().isoformat()
+            torch.cuda.synchronize()
+            execution_start_time = time.perf_counter()
+            execution_start_timestamp = datetime.now().isoformat()
             
             model = self.shift_model if use_shift_model else self.model
             with set_shift_parallel_mode(use_shift_model):
@@ -544,11 +645,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             sampler_output.sampled_token_ids = output_token_ids
 
         #### Record GPU execution end time after all GPU computations are complete
-        # torch.cuda.synchronize()
-        # execution_end_time = time.perf_counter()
-        # execution_duration = execution_end_time - execution_start_time
-        # self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
-        #                         scheduler_output.total_num_scheduled_tokens, early_return=False)
+        torch.cuda.synchronize()
+        execution_end_time = time.perf_counter()
+        execution_duration = execution_end_time - execution_start_time
+        self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
+                                scheduler_output.total_num_scheduled_tokens, early_return=False)
 
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
@@ -798,15 +899,20 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         Returns:
             The problem_id if found, None otherwise
         """
+        # Method 1: Use current batch mapping (most efficient and reliable)
+        if hasattr(self, '_current_batch_req_id_to_problem_id'):
+            problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
+            if problem_id is not None:
+                return problem_id
+
+        # Method 2: Use ProblemIdContextManager mapping
         try:
-            if hasattr(self, 'input_batch') and self.input_batch and hasattr(self.input_batch, 'req_ids'):
-                req_ids = self.input_batch.req_ids
-                if req_id in req_ids:
-                    index = req_ids.index(req_id)
-                    return self._get_problem_id_for_index(index)
+            problem_id = ProblemIdContextManager.get_problem_id_for_req_id(req_id)
+            if problem_id is not None:
+                return problem_id
         except Exception as e:
-            logger.debug(f"Failed to get problem_id for request {req_id}: {e}")
-        
+            print(f"error:{e}")
+        #print(f"Failed to get problem_id for request {req_id}")
         return None
 
     def propose_draft_token_ids(
@@ -934,6 +1040,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         seen_req_ids = set()
         for i, sampled_ids in enumerate(sampled_token_ids):
             req_id = self.input_batch.req_ids[i]
+            problem_id = self.get_problem_id_by_request_id(req_id)
             seen_req_ids.add(req_id)
 
             # # Only update suffix cache for hard problems (by problem_id)
@@ -948,22 +1055,98 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             #print(f"DEBUG: Updating suffix cache for hard problem req_id={req_id}, sampled_ids={sampled_ids}")
             
             index = self.input_batch.req_id_to_index[req_id]
-            if not self._suffix_cache.has_cached_prompt(req_id):
+            if not self._suffix_cache.has_cached_prompt(problem_id):
                 num_prompt_tokens = self.input_batch.num_prompt_tokens[index]
                 prompt_token_ids = (
                     self.input_batch.token_ids_cpu[index, :num_prompt_tokens])
                 #print(f"DEBUG: Caching prompt for req_id={req_id}, prompt_tokens={num_prompt_tokens}")
-                self._suffix_cache.cache_prompt(req_id, prompt_token_ids)
+                self._suffix_cache.cache_prompt(problem_id, prompt_token_ids)
             # else:
             #     print(f"DEBUG: Prompt already cached for req_id={req_id}")
 
             #print(f"DEBUG: Updating response for req_id={req_id} with {len(sampled_ids)} tokens")
-            self._suffix_cache.update_response(req_id, sampled_ids)
+            self._suffix_cache.update_response(problem_id, sampled_ids)
 
-        # Evict prompts that are not seen
-        for req_id in self._suffix_cache.cached_prompt_ids():
-            if req_id not in seen_req_ids:
-                self._suffix_cache.evict_prompt(req_id)
+        # # # Evict prompts that are not seen
+        # for req_id in self._suffix_cache.cached_prompt_ids():
+        #     if req_id not in seen_req_ids:
+        #         self._suffix_cache.evict_prompt(req_id)
+
+    # def propose_suffix_draft_token_ids(
+    #     self,
+    #     sampled_token_ids: list[list[int]],
+    #     spec_token_ids: Optional[list[list[int]]] = None,
+    # ) -> list[list[int]]:
+    #     config = self.speculative_config
+    #     # Pre-allocate results with defaults for empty inputs
+    #     results: list[SuffixSpecResult] = [SuffixSpecResult() for _ in sampled_token_ids]
+
+    #     # First pass: update token buffer and prepare speculate arguments to avoid
+    #     # concurrent writes into shared buffers.
+    #     tasks: list[tuple[int, Hashable, list[int], int, float, float, float]] = []
+    #     for i, sampled_ids in enumerate(sampled_token_ids):
+    #         spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
+    #         num_sampled_ids = len(sampled_ids)
+    #         if not num_sampled_ids:
+    #             continue
+
+    #         req_id = self.input_batch.req_ids[i]
+    #         problem_id = self.get_problem_id_by_request_id(req_id)  # Method 1: Direct lookup
+    #         if problem_id is None:
+    #             print(f"problem_id is None for req_id={req_id}")
+
+    #         # Add sampled_token_ids to token_ids_cpu.
+    #         start_idx = self.input_batch.num_tokens_no_spec[i]
+    #         end_idx = start_idx + num_sampled_ids
+    #         self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
+
+    #         size = min(end_idx, config.suffix_cache_max_depth)
+    #         base_segment = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx]
+    #         pattern = base_segment.tolist() + spec_ids
+    #         if len(pattern) > config.suffix_cache_max_depth:
+    #             pattern = pattern[-config.suffix_cache_max_depth:]
+
+    #         max_spec_tokens = min(
+    #             MAX_SPEC_LEN - len(spec_ids),
+    #             config.suffix_cache_max_depth,
+    #             self.max_model_len - end_idx - 1,
+    #         )
+    #         max_spec_factor = config.suffix_max_spec_factor
+    #         max_spec_offset = (
+    #             config.suffix_max_spec_offset - len(spec_ids) * (max_spec_factor + 1)
+    #         )
+
+    #         tasks.append(
+    #             (
+    #                 i,
+    #                 problem_id,
+    #                 pattern,
+    #                 max_spec_tokens,
+    #                 max_spec_factor,
+    #                 max_spec_offset,
+    #                 config.suffix_min_token_prob,
+    #             )
+    #         )
+
+        # def _speculate_one(task: tuple[int, Hashable, list[int], int, float, float, float]):
+        #     idx, req_id, pattern, max_spec_tokens, max_spec_factor, max_spec_offset, min_token_prob = task
+        #     result = self._suffix_cache.speculate(
+        #         req_id,
+        #         pattern,
+        #         max_spec_tokens=max_spec_tokens,
+        #         max_spec_factor=max_spec_factor,
+        #         max_spec_offset=max_spec_offset,
+        #         min_token_prob=min_token_prob,
+        #     )
+        #     return idx, result
+
+        # if tasks:
+        #     with ThreadPoolExecutor() as executor:
+        #         for idx, result in executor.map(_speculate_one, tasks):
+        #             results[idx] = result
+
+        # return results
+
 
     def propose_suffix_draft_token_ids(
         self,
@@ -971,69 +1154,66 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         spec_token_ids: Optional[list[list[int]]] = None,
     ) -> list[list[int]]:
         config = self.speculative_config
-        # Pre-allocate results with defaults for empty inputs
-        results: list[SuffixSpecResult] = [SuffixSpecResult() for _ in sampled_token_ids]
-
-        # First pass: update token buffer and prepare speculate arguments to avoid
-        # concurrent writes into shared buffers.
-        tasks: list[tuple[int, Hashable, list[int], int, float, float, float]] = []
+        results = []
         for i, sampled_ids in enumerate(sampled_token_ids):
             spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
             num_sampled_ids = len(sampled_ids)
             if not num_sampled_ids:
+                # Skip speculative decoding.
+                results.append(SuffixSpecResult())
                 continue
 
             req_id = self.input_batch.req_ids[i]
+            problem_id = self.get_problem_id_by_request_id(req_id)  # Method 1: Direct lookup
+            if problem_id is None:
+                print(f"problem_id is None for req_id={req_id}")
 
             # Add sampled_token_ids to token_ids_cpu.
             start_idx = self.input_batch.num_tokens_no_spec[i]
-            end_idx = start_idx + num_sampled_ids
+            end_idx = start_idx + len(sampled_ids)
+
+            if end_idx >= self.max_model_len:
+                results.append(SuffixSpecResult())
+                self.input_batch.token_ids_cpu[
+                    i, start_idx:self.
+                    max_model_len] = sampled_ids[:self.max_model_len -
+                                                 start_idx]
+                continue
+
             self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
 
             size = min(end_idx, config.suffix_cache_max_depth)
-            base_segment = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx]
-            pattern = base_segment.tolist() + spec_ids
+            pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx]
+            pattern = pattern.tolist() + spec_ids
             if len(pattern) > config.suffix_cache_max_depth:
                 pattern = pattern[-config.suffix_cache_max_depth:]
-
-            max_spec_tokens = min(
-                MAX_SPEC_LEN - len(spec_ids),
-                config.suffix_cache_max_depth,
-                self.max_model_len - end_idx - 1,
-            )
+            max_spec_tokens = min(MAX_SPEC_LEN - len(spec_ids),
+                                  config.suffix_cache_max_depth,
+                                  self.max_model_len - end_idx - 1)
+            # max_spec_offset is modified to mimic the behavior of the original
+            # max_spec_factor and max_spec_offset as if the speculative tokens
+            # were generated by suffix decoding. For example, if:
+            #   - max_spec_factor = 2
+            #   - max_spec_offset = -1
+            #   - we've already speculated 3 tokens
+            #   - and the suffix match length is 6
+            # Then:
+            #   - The match length before the already-speculated tokens is 3
+            #   - The original config allow up to 5 speculated tokens total
+            #   - Already speculated 3 tokens, so should allow 2 more tokens
+            # So the new config should map match length 6 to 2 max spec tokens.
             max_spec_factor = config.suffix_max_spec_factor
-            max_spec_offset = (
-                config.suffix_max_spec_offset - len(spec_ids) * (max_spec_factor + 1)
-            )
-
-            tasks.append(
-                (
-                    i,
-                    req_id,
-                    pattern,
-                    max_spec_tokens,
-                    max_spec_factor,
-                    max_spec_offset,
-                    config.suffix_min_token_prob,
-                )
-            )
-
-        def _speculate_one(task: tuple[int, Hashable, list[int], int, float, float, float]):
-            idx, req_id, pattern, max_spec_tokens, max_spec_factor, max_spec_offset, min_token_prob = task
+            max_spec_offset = (config.suffix_max_spec_offset - len(spec_ids) *
+                               (max_spec_factor + 1))
             result = self._suffix_cache.speculate(
-                req_id,
+                problem_id,
                 pattern,
                 max_spec_tokens=max_spec_tokens,
                 max_spec_factor=max_spec_factor,
                 max_spec_offset=max_spec_offset,
-                min_token_prob=min_token_prob,
-            )
-            return idx, result
+                min_token_prob=config.suffix_min_token_prob)
 
-        if tasks:
-            with ThreadPoolExecutor() as executor:
-                for idx, result in executor.map(_speculate_one, tasks):
-                    results[idx] = result
+            results.append(result)
 
         return results
 

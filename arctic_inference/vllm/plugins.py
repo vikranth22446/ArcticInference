@@ -111,6 +111,10 @@ def arctic_inference_plugin():
     # Patches that make later patches work properly.
     EngineCoreProcPatch.apply_patch()
     WorkerBasePatch.apply_patch()
+    
+    # Apply LLM patches for problem_id support (early application)
+    from arctic_inference.vllm.llm import apply_llm_patches
+    apply_llm_patches()
 
     # Patches to vLLM arguments and configuration objects.
     EngineArgsPatch.apply_patch()

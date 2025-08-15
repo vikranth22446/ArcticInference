@@ -58,9 +58,9 @@ class SuffixCache:
     
     def __init__(self, max_depth: int = 64):
         self._max_depth = max_depth
-        self._suffix_tree = SuffixTree(max_depth)
+        #self._suffix_tree = SuffixTree(max_depth)
         self._prompt_trees = {}
-        self._req_to_seq_id = {}
+        #self._req_to_seq_id = {}
 
     @property
     def max_depth(self) -> int:
@@ -138,7 +138,7 @@ class SuffixCache:
             - If token_ids is a single integer, it's added as a single token.
             - If token_ids is a sequence, all tokens in the sequence are added.
         """
-        seq_id = self._get_or_assign_seq_id(req_id)
+        #seq_id = self._get_or_assign_seq_id(req_id)
         if isinstance(token_ids, int):
             #self._suffix_tree.append(seq_id, token_ids)
             if req_id in self._prompt_trees:

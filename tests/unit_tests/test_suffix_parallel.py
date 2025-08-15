@@ -176,7 +176,7 @@ def _propose_parallel(input_batch: _InputBatch,
     return results
 
 
-@pytest.mark.parametrize("batch_size", [1, 2, 4])
+@pytest.mark.parametrize("batch_size", [1, 4,16,128,256])
 def test_parallel_matches_serial(batch_size):
     max_model_len = 4096
     max_spec_len = 8

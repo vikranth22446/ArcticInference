@@ -13,7 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-#python ArcticInference/arctic_inference/common/suffix_cache/simulator.py /app/src/rllm/data/rollout_data/deepscaler_1.5b/hard20_16k__n8_0/1.jsonl  --tokenizer deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --format jsonl --train-dataset /app/src/rllm/data/rollout_data/deepscaler_1.5b/hard20_16k__n8_2/1.jsonl --output /app/src/outputs 
+
+#python src/ArcticInference/arctic_inference/common/suffix_cache/simulator.py /app/src/rllm/data/rollout_data/deepscaler_1.5b/hard20_16k__n8_0/input_01.jsonl --format jsonl --train-dataset /app/src/rllm/data/rollout_data/deepscaler_1.5b/hard20_16k__n8_1/input_01.jsonl --tokenizer deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --output src/data/suffix_simulator
+
 import argparse
 import itertools
 import multiprocessing as mp
@@ -406,8 +408,19 @@ def main(args: argparse.Namespace):
     print(summary.to_string() + "\n")
 
     if args.output is not None:
-        df.to_csv(args.output, index=False)
-        print(f"Detailed results saved to: {args.output}")
+        output_path = args.output
+        # If the provided output is a directory or has no extension,
+        # treat it as a directory and write a default CSV file into it.
+        if os.path.isdir(output_path) or os.path.splitext(output_path)[1] == "":
+            os.makedirs(output_path, exist_ok=True)
+            output_path = os.path.join(output_path, "results.csv")
+        else:
+            parent_dir = os.path.dirname(output_path)
+            if parent_dir:
+                os.makedirs(parent_dir, exist_ok=True)
+
+        df.to_csv(output_path, index=False)
+        print(f"Detailed results saved to: {output_path}")
 
 
 def bool_arg(v):
@@ -489,7 +502,7 @@ def get_parser():
         "--max-depth",
         type=int,
         nargs="+",
-        default=[64],
+        default=[32],
         help="Max depth of the suffix tree",
     )
     parser.add_argument(
@@ -503,7 +516,7 @@ def get_parser():
         "--max-spec-factor",
         type=float,
         nargs="+",
-        default=[1.0],
+        default=[3.0],
         help="Max speculation tokens as a multiplier of the prefix length",
     )
     parser.add_argument(
