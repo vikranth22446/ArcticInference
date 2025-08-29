@@ -60,7 +60,16 @@ struct Candidate {
     int match_len = 0;
 };
 
+// Forward declaration for extractor
+#ifdef DEBUG_VISUALIZATION
+class SuffixTreeExtractor;
+#endif
+
 class SuffixTree {
+#ifdef DEBUG_VISUALIZATION
+    friend class SuffixTreeExtractor;
+#endif
+    
 public:
 
     SuffixTree(int max_depth);

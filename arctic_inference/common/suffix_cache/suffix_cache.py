@@ -58,9 +58,9 @@ class SuffixCache:
     
     def __init__(self, max_depth: int = 64):
         self._max_depth = max_depth
-        #self._suffix_tree = SuffixTree(max_depth)
+        self._suffix_tree = SuffixTree(max_depth)
         self._prompt_trees = {}
-        #self._req_to_seq_id = {}
+        self._req_to_seq_id = {}
 
     @property
     def max_depth(self) -> int:
@@ -138,13 +138,13 @@ class SuffixCache:
             - If token_ids is a single integer, it's added as a single token.
             - If token_ids is a sequence, all tokens in the sequence are added.
         """
-        #seq_id = self._get_or_assign_seq_id(req_id)
+        seq_id = self._get_or_assign_seq_id(req_id)
         if isinstance(token_ids, int):
-            #self._suffix_tree.append(seq_id, token_ids)
+            self._suffix_tree.append(seq_id, token_ids)
             if req_id in self._prompt_trees:
                 self._prompt_trees[req_id].append(0, token_ids)
         else:
-            #self._suffix_tree.extend(seq_id, token_ids)
+            self._suffix_tree.extend(seq_id, token_ids)
             if req_id in self._prompt_trees:
                 self._prompt_trees[req_id].extend(0, token_ids)
 
@@ -194,7 +194,6 @@ class SuffixCache:
 
         if max_spec_tokens is None:
             max_spec_tokens = self.max_depth
-        max_spec_tokens = 4
         #max_spec_offset = -1
 
         if len(pattern) > self._max_depth:
@@ -214,13 +213,14 @@ class SuffixCache:
         else:
             result = SuffixSpecResult()
 
-        # candidate = self._suffix_tree.speculate(
-        #     pattern,
-        #     max_spec_tokens,
-        #     max_spec_factor,
-        #     max_spec_offset,
-        #     min_token_prob,
-        #     use_tree_spec)
-        # if candidate.score > result.score:
-        #     result = SuffixSpecResult.from_candidate(candidate)
+
+        candidate = self._suffix_tree.speculate(
+            pattern,
+            max_spec_tokens,
+            max_spec_factor,
+            max_spec_offset,
+            min_token_prob,
+            use_tree_spec)
+        if candidate.score > result.score:
+            result = SuffixSpecResult.from_candidate(candidate)
         return result

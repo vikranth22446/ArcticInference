@@ -113,8 +113,8 @@ def arctic_inference_plugin():
     WorkerBasePatch.apply_patch()
     
     # Apply LLM patches for problem_id support (early application)
-    from arctic_inference.vllm.llm import apply_llm_patches
-    apply_llm_patches()
+    # from arctic_inference.vllm.llm import apply_llm_patches
+    # apply_llm_patches()
 
     # Patches to vLLM arguments and configuration objects.
     EngineArgsPatch.apply_patch()

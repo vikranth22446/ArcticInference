@@ -14,10 +14,11 @@
 # limitations under the License.
 
 
-#python src/ArcticInference/arctic_inference/common/suffix_cache/simulator.py /app/src/rllm/data/rollout_data/deepscaler_1.5b/hard20_16k__n8_0/input_01.jsonl --format jsonl --train-dataset /app/src/rllm/data/rollout_data/deepscaler_1.5b/hard20_16k__n8_1/input_01.jsonl --tokenizer deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --output src/data/suffix_simulator
+#python src/ArcticInference/arctic_inference/common/suffix_cache/simulator.py /app/src/ArcticInference/tests/data.jsonl --format jsonl --train-dataset /app/src/ArcticInference/tests/data.jsonl --tokenizer deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --output src/data/suffix_simulator
 
 import argparse
 import itertools
+import json
 import multiprocessing as mp
 import os
 import time
@@ -28,7 +29,20 @@ import pandas as pd
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
+# Import suffix cache
 from arctic_inference.common.suffix_cache import SuffixCache
+
+try:
+    from .vis_tree import SuffixTreeVisualizer
+except ImportError:
+    try:
+        # Fallback to absolute import if relative import fails
+        from vis_tree import SuffixTreeVisualizer
+    except ImportError:
+        print("Warning: Could not import SuffixTreeVisualizer. Visualization will be disabled.")
+        SuffixTreeVisualizer = None
+
+
 
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
@@ -43,6 +57,8 @@ def suffix_decode(
     min_token_prob: float,
     use_tree_spec: bool,
     use_cached_prompt: bool,
+    debug_file_path: Optional[str] = None,
+    tokenizer = None,
 ) -> List[Dict]:
     if not max_spec_tokens:
         max_spec_tokens = suffix_cache.max_depth
@@ -52,20 +68,27 @@ def suffix_decode(
 
     assert isinstance(prompt, list) and isinstance(ground_truth_response, list)
 
+    # Open debug file if specified
+    debug_file = None
+    if debug_file_path:
+        debug_file = open(debug_file_path, 'a', encoding='utf-8')
+
     results = []
     response = []
+    step_counter = 0
     while len(response) < len(ground_truth_response):
         text = prompt + response
+        pattern = text[-16:]
 
         start_time = time.perf_counter()
         result = suffix_cache.speculate(
             request_id,
-            text,
+            pattern,
             max_spec_tokens=max_spec_tokens,
             max_spec_factor=max_spec_factor,
             min_token_prob=min_token_prob,
             use_tree_spec=use_tree_spec,
-            use_cached_prompt=use_cached_prompt,
+            use_cached_prompt=True,
         )
         end_time = time.perf_counter()
         spec_time = end_time - start_time
@@ -86,11 +109,59 @@ def suffix_decode(
         new_tokens = accepted_tokens.copy()
         response.extend(accepted_tokens)
         assert len(response) <= len(ground_truth_response)
-        if len(response)  < len(ground_truth_response):
+        
+        # Handle bonus token
+        bonus_token = None
+        bonus_text = ""
+        if len(response) < len(ground_truth_response):
             # Add bonus token
             bonus_token = ground_truth_response[len(response)]
             new_tokens.append(bonus_token)
             response.append(bonus_token)
+            
+            if tokenizer:
+                bonus_text = tokenizer.decode([bonus_token], skip_special_tokens=True)
+
+        # Debug output for each step (after all tokens are processed)
+        if debug_file:
+            # Match tokens (from result.match_len)
+            match_tokens = text[-result.match_len:] if result.match_len > 0 else []
+            match_text = ""
+            if tokenizer and match_tokens:
+                match_text = tokenizer.decode(match_tokens, skip_special_tokens=True)
+            
+            # Spec tokens (all speculated tokens)
+            spec_tokens = result.token_ids
+            spec_text = ""
+            if tokenizer and spec_tokens:
+                spec_text = tokenizer.decode(spec_tokens, skip_special_tokens=True)
+            
+            # Accept tokens (accepted tokens)
+            accept_text = ""
+            if tokenizer and accepted_tokens:
+                accept_text = tokenizer.decode(accepted_tokens, skip_special_tokens=True)
+            
+            # Create JSON object for this step with all information
+            debug_data = {
+                "request_id": request_id,
+                "step": step_counter,
+                "match_tokens": match_tokens,
+                "match_text": match_text,
+                "match_length": result.match_len,
+                "spec_tokens": spec_tokens,
+                "spec_text": spec_text,
+                "num_spec_tokens": len(spec_tokens),
+                "accept_tokens": accepted_tokens,
+                "accept_text": accept_text,
+                "num_accept_tokens": len(accepted_tokens),
+                "bonus_token": bonus_token,
+                "bonus_text": bonus_text,
+                "num_output_tokens": len(new_tokens),
+                "score": result.score
+            }
+            
+            debug_file.write(json.dumps(debug_data, ensure_ascii=False) + '\n')
+            debug_file.flush()
 
         # Update suffix cache
         start_time = time.perf_counter()
@@ -108,8 +179,14 @@ def suffix_decode(
             "spec_ms": spec_time * 1000,
             "update_ms": update_time * 1000,
         })
+        
+        step_counter += 1
 
     assert response == ground_truth_response
+
+    # Close debug file
+    if debug_file:
+        debug_file.close()
 
     if use_cached_prompt:
         suffix_cache.evict_prompt(request_id)
@@ -162,6 +239,10 @@ def process_task(
     min_token_prob: float,
     use_tree_spec: bool,
     use_cached_prompt: bool,
+    debug_file_path: Optional[str] = None,
+    tokenizer = None,
+    enable_visualization: bool = False,
+    viz_output_dir: Optional[str] = None,
 ) -> List[Dict]:
     eval_subset, train_subset = sample_data(
         dataset,
@@ -176,7 +257,62 @@ def process_task(
                                     desc=f"Building cache"):
         # Use negative request_id to indicate training examples and avoid
         # conflicts with eval request_ids numbered 0, .., num_eval - 1.
-        suffix_cache.update_response(-1 - request_id + 1, example["response"])
+        suffix_cache.update_response(-1 - request_id, example["prompt"])
+        suffix_cache.update_response(-1 - request_id, example["response"])
+
+    # Visualize the suffix tree after building
+    if enable_visualization and SuffixTreeVisualizer is not None:
+        print("Generating suffix tree visualizations...")
+        try:
+            # Create visualizer
+            viz = SuffixTreeVisualizer(suffix_cache=suffix_cache)
+            
+            # Set tokenizer for better visualization
+            if tokenizer is not None:
+                viz.set_tokenizer(tokenizer)
+            
+            # Create output directory for visualizations
+            if viz_output_dir is None:
+                viz_output_dir = "suffix_tree_visualizations"
+            os.makedirs(viz_output_dir, exist_ok=True)
+            
+            # Generate different visualizations
+            print(f"Saving visualizations to {viz_output_dir}/")
+            
+            # 1. Print tree structure to text file
+            tree_structure_file = os.path.join(viz_output_dir, f"tree_structure_task_{task_id}.txt")
+            with open(tree_structure_file, 'w', encoding='utf-8') as f:
+                import sys
+                original_stdout = sys.stdout
+                sys.stdout = f
+                try:
+                    viz.print_tree_structure()
+                finally:
+                    sys.stdout = original_stdout
+            print(f"  - Tree structure saved to: {tree_structure_file}")
+            
+            # 2. Generate graph visualization
+            graph_file = os.path.join(viz_output_dir, f"suffix_tree_graph_task_{task_id}.png")
+            viz.visualize_tree_graph(max_nodes=100, output_file=graph_file)
+            print(f"  - Tree graph saved to: {graph_file}")
+            
+            # 3. Print debugging statistics
+            stats_file = os.path.join(viz_output_dir, f"tree_statistics_task_{task_id}.txt")
+            with open(stats_file, 'w', encoding='utf-8') as f:
+                original_stdout = sys.stdout
+                sys.stdout = f
+                try:
+                    viz.debug_statistics()
+                finally:
+                    sys.stdout = original_stdout
+            print(f"  - Tree statistics saved to: {stats_file}")
+            
+            print("Suffix tree visualization completed successfully!")
+            
+        except Exception as e:
+            print(f"Warning: Failed to generate visualizations: {e}")
+            import traceback
+            traceback.print_exc()
 
     records = []
     for request_id, example in tqdm(eval_subset.iterrows(),
@@ -192,6 +328,8 @@ def process_task(
             min_token_prob=min_token_prob,
             use_tree_spec=use_tree_spec,
             use_cached_prompt=use_cached_prompt,
+            debug_file_path=debug_file_path,
+            tokenizer=tokenizer,
         )
         for result in results:
             result.update({
@@ -367,15 +505,21 @@ def get_data(args: argparse.Namespace) -> Tuple[pd.DataFrame,
 
 def main(args: argparse.Namespace):
     dataset, train_dataset = get_data(args)
-    # Tokenize datasets (if needed)
+    
+    # Initialize tokenizer if provided
+    tokenizer = None
     if args.tokenizer is not None:
-        dataset = tokenize_data(dataset, args.tokenizer)
-        if train_dataset is not None:
-            train_dataset = tokenize_data(train_dataset, args.tokenizer)
-    else:
-        ensure_tokenized(dataset)
-        if train_dataset is not None:
-            ensure_tokenized(train_dataset)
+        tokenizer = AutoTokenizer.from_pretrained(args.tokenizer)
+        
+    # # Tokenize datasets (if needed)
+    # if args.tokenizer is not None:
+    #     dataset = tokenize_data(dataset, args.tokenizer)
+    #     if train_dataset is not None:
+    #         train_dataset = tokenize_data(train_dataset, args.tokenizer)
+    # else:
+    #     ensure_tokenized(dataset)
+    #     if train_dataset is not None:
+    #         ensure_tokenized(train_dataset)
     # Create all possible configurations
     num_eval = args.num_eval or [None]
     num_train = args.num_train or [None]
@@ -391,8 +535,27 @@ def main(args: argparse.Namespace):
         use_cached_prompt=args.use_cached_prompt,
     )
     config_values = itertools.product(*configs.values())
+    
+    # Prepare debug file path if output is specified
+    debug_file_path = None
+    if args.output is not None:
+        output_dir = args.output if os.path.isdir(args.output) or os.path.splitext(args.output)[1] == "" else os.path.dirname(args.output)
+        debug_file_path = os.path.join(output_dir, "debug_tokens.jsonl")
+        # Clear debug file at start
+        if os.path.exists(debug_file_path):
+            os.remove(debug_file_path)
+    
+    # Prepare visualization settings
+    enable_visualization = getattr(args, 'enable_visualization', False)
+    viz_output_dir = getattr(args, 'viz_output', None)
+    if viz_output_dir is None and args.output is not None:
+        # Use the main output directory for visualizations
+        base_output_dir = args.output if os.path.isdir(args.output) or os.path.splitext(args.output)[1] == "" else os.path.dirname(args.output)
+        viz_output_dir = os.path.join(base_output_dir, "visualizations")
+
     config_values = [
-        (dataset, train_dataset, i, *v) for i, v in enumerate(config_values)]
+        (dataset, train_dataset, i, *v, debug_file_path, tokenizer, enable_visualization, viz_output_dir) 
+        for i, v in enumerate(config_values)]
 
     records = []
     with mp.Pool(args.parallel) as pool:
@@ -421,6 +584,9 @@ def main(args: argparse.Namespace):
 
         df.to_csv(output_path, index=False)
         print(f"Detailed results saved to: {output_path}")
+        
+    if debug_file_path and os.path.exists(debug_file_path):
+        print(f"Debug token information (JSONL format) saved to: {debug_file_path}")
 
 
 def bool_arg(v):
@@ -450,13 +616,13 @@ def get_parser():
     parser.add_argument(
         "--prompt-column",
         type=str,
-        default="input",
+        default="input_token_ids",
         help="Column name for the prompts in the dataset",
     )
     parser.add_argument(
         "--response-column",
         type=str,
-        default="output",
+        default="output_token_ids",
         help="Column name for the responses in the dataset",
     )
     parser.add_argument(
@@ -516,7 +682,7 @@ def get_parser():
         "--max-spec-factor",
         type=float,
         nargs="+",
-        default=[3.0],
+        default=[2.0],
         help="Max speculation tokens as a multiplier of the prefix length",
     )
     parser.add_argument(
@@ -530,7 +696,7 @@ def get_parser():
         "--use-tree-spec",
         type=bool_arg,
         nargs="*",
-        default=[True],
+        default=[False],
         help="Whether to use tree-based speculation (True/False)",
     )
     parser.add_argument(
@@ -540,6 +706,16 @@ def get_parser():
         default=[True],
         help=("Whether to use the cached prompt for the request in addition "
               "to the global cache of previous responses (True/False)"),
+    )
+    parser.add_argument(
+        "--enable-visualization",
+        default=[True],
+        help="Enable suffix tree visualization after building",
+    )
+    parser.add_argument(
+        "--viz-output",
+        type=str,
+        help="Directory path for visualization outputs (if not specified, uses output directory + '/visualizations')",
     )
     return parser
 
