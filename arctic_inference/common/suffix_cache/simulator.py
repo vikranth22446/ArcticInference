@@ -14,13 +14,14 @@
 # limitations under the License.
 
 
-#python src/ArcticInference/arctic_inference/common/suffix_cache/simulator.py /app/src/ArcticInference/tests/data.jsonl --format jsonl --train-dataset /app/src/ArcticInference/tests/data.jsonl --tokenizer deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --output src/data/suffix_simulator
+#python src/ArcticInference/arctic_inference/common/suffix_cache/simulator.py /app/src/ArcticInference/tests/cleaned_0019_4.jsonl --format jsonl --train-dataset /app/src/ArcticInference/tests/cleaned_all.jsonl --tokenizer deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B --output src/data/suffix_simulator
 
 import argparse
 import itertools
 import json
 import multiprocessing as mp
 import os
+from pickle import FALSE
 import time
 from collections import OrderedDict
 from typing import Dict, List, Optional, Tuple
@@ -260,59 +261,59 @@ def process_task(
         suffix_cache.update_response(-1 - request_id, example["prompt"])
         suffix_cache.update_response(-1 - request_id, example["response"])
 
-    # Visualize the suffix tree after building
-    if enable_visualization and SuffixTreeVisualizer is not None:
-        print("Generating suffix tree visualizations...")
-        try:
-            # Create visualizer
-            viz = SuffixTreeVisualizer(suffix_cache=suffix_cache)
+    # # Visualize the suffix tree after building
+    # if enable_visualization and SuffixTreeVisualizer is not None:
+    #     print("Generating suffix tree visualizations...")
+    #     try:
+    #         # Create visualizer
+    #         viz = SuffixTreeVisualizer(suffix_cache=suffix_cache)
             
-            # Set tokenizer for better visualization
-            if tokenizer is not None:
-                viz.set_tokenizer(tokenizer)
+    #         # Set tokenizer for better visualization
+    #         if tokenizer is not None:
+    #             viz.set_tokenizer(tokenizer)
             
-            # Create output directory for visualizations
-            if viz_output_dir is None:
-                viz_output_dir = "suffix_tree_visualizations"
-            os.makedirs(viz_output_dir, exist_ok=True)
+    #         # Create output directory for visualizations
+    #         if viz_output_dir is None:
+    #             viz_output_dir = "suffix_tree_visualizations"
+    #         os.makedirs(viz_output_dir, exist_ok=True)
             
-            # Generate different visualizations
-            print(f"Saving visualizations to {viz_output_dir}/")
+    #         # Generate different visualizations
+    #         print(f"Saving visualizations to {viz_output_dir}/")
             
-            # 1. Print tree structure to text file
-            tree_structure_file = os.path.join(viz_output_dir, f"tree_structure_task_{task_id}.txt")
-            with open(tree_structure_file, 'w', encoding='utf-8') as f:
-                import sys
-                original_stdout = sys.stdout
-                sys.stdout = f
-                try:
-                    viz.print_tree_structure()
-                finally:
-                    sys.stdout = original_stdout
-            print(f"  - Tree structure saved to: {tree_structure_file}")
+    #         # 1. Print tree structure to text file
+    #         tree_structure_file = os.path.join(viz_output_dir, f"tree_structure_task_{task_id}.txt")
+    #         with open(tree_structure_file, 'w', encoding='utf-8') as f:
+    #             import sys
+    #             original_stdout = sys.stdout
+    #             sys.stdout = f
+    #             try:
+    #                 viz.print_tree_structure()
+    #             finally:
+    #                 sys.stdout = original_stdout
+    #         print(f"  - Tree structure saved to: {tree_structure_file}")
             
-            # 2. Generate graph visualization
-            graph_file = os.path.join(viz_output_dir, f"suffix_tree_graph_task_{task_id}.png")
-            viz.visualize_tree_graph(max_nodes=100, output_file=graph_file)
-            print(f"  - Tree graph saved to: {graph_file}")
+    #         # 2. Generate graph visualization
+    #         graph_file = os.path.join(viz_output_dir, f"suffix_tree_graph_task_{task_id}.png")
+    #         viz.visualize_tree_graph(max_nodes=100, output_file=graph_file)
+    #         print(f"  - Tree graph saved to: {graph_file}")
             
-            # 3. Print debugging statistics
-            stats_file = os.path.join(viz_output_dir, f"tree_statistics_task_{task_id}.txt")
-            with open(stats_file, 'w', encoding='utf-8') as f:
-                original_stdout = sys.stdout
-                sys.stdout = f
-                try:
-                    viz.debug_statistics()
-                finally:
-                    sys.stdout = original_stdout
-            print(f"  - Tree statistics saved to: {stats_file}")
+    #         # 3. Print debugging statistics
+    #         stats_file = os.path.join(viz_output_dir, f"tree_statistics_task_{task_id}.txt")
+    #         with open(stats_file, 'w', encoding='utf-8') as f:
+    #             original_stdout = sys.stdout
+    #             sys.stdout = f
+    #             try:
+    #                 viz.debug_statistics()
+    #             finally:
+    #                 sys.stdout = original_stdout
+    #         print(f"  - Tree statistics saved to: {stats_file}")
             
-            print("Suffix tree visualization completed successfully!")
+    #         print("Suffix tree visualization completed successfully!")
             
-        except Exception as e:
-            print(f"Warning: Failed to generate visualizations: {e}")
-            import traceback
-            traceback.print_exc()
+    #     except Exception as e:
+    #         print(f"Warning: Failed to generate visualizations: {e}")
+    #         import traceback
+    #         traceback.print_exc()
 
     records = []
     for request_id, example in tqdm(eval_subset.iterrows(),
@@ -709,7 +710,7 @@ def get_parser():
     )
     parser.add_argument(
         "--enable-visualization",
-        default=[True],
+        default=[False],
         help="Enable suffix tree visualization after building",
     )
     parser.add_argument(

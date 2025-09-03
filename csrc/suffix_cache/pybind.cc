@@ -38,6 +38,18 @@ PYBIND11_MODULE(_C, m) {
         .def("num_seqs", &SuffixTree::num_seqs)
         .def("append", &SuffixTree::append)
         .def("extend", &SuffixTree::extend)
+        
+        // 🆕 Thread-safe methods with GIL release + per-object locking
+        .def("append_safe", &SuffixTree::append_safe, 
+             py::call_guard<py::gil_scoped_release>(),
+             "Thread-safe append with per-object locking and GIL release")
+        .def("extend_safe", &SuffixTree::extend_safe, 
+             py::call_guard<py::gil_scoped_release>(),
+             "Thread-safe extend with per-object locking and GIL release")
+        .def("num_seqs_safe", &SuffixTree::num_seqs_safe,
+             py::call_guard<py::gil_scoped_release>(),
+             "Thread-safe num_seqs with per-object locking and GIL release")
+             
         .def("speculate", &SuffixTree::speculate,py::call_guard<py::gil_scoped_release>())
 
 #ifdef DEBUG_VISUALIZATION

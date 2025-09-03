@@ -20,6 +20,7 @@
 #include <memory>
 #include <unordered_map>
 #include <vector>
+#include <mutex>
 
 struct Node {
     // Number of suffixes from the root that end at or pass through this node.
@@ -84,6 +85,13 @@ public:
     // Append multiple new elements to the sequence with id seq_id.
     void extend(int seq_id, const std::vector<int>& tokens);
 
+    // 🆕 Thread-safe versions with per-object locking
+    void append_safe(int seq_id, int token);
+    void extend_safe(int seq_id, const std::vector<int>& tokens);
+    
+    // Thread-safe num_seqs (reads shared data)
+    int num_seqs_safe() const;
+
     Candidate speculate(const std::vector<int>& pattern,
                         int max_spec_tokens,
                         float max_spec_factor = 1.0f,
@@ -92,6 +100,9 @@ public:
                         bool use_tree_spec = false);
 
 private:
+
+    // 🆕 Per-object mutex for thread safety
+    mutable std::mutex _tree_mutex;
 
     // Maximum depth of the suffix tree.
     int _max_depth;
