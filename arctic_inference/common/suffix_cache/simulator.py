@@ -51,6 +51,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 def suffix_decode(
     suffix_cache: SuffixCache,
     request_id: int,
+    problem_id: int,
     prompt: List[int],
     ground_truth_response: List[int],
     max_spec_tokens: int,
@@ -84,6 +85,7 @@ def suffix_decode(
         start_time = time.perf_counter()
         result = suffix_cache.speculate(
             request_id,
+            problem_id,
             pattern,
             max_spec_tokens=max_spec_tokens,
             max_spec_factor=max_spec_factor,
@@ -166,7 +168,7 @@ def suffix_decode(
 
         # Update suffix cache
         start_time = time.perf_counter()
-        suffix_cache.update_response(request_id, new_tokens)
+        suffix_cache.update_response(request_id, problem_id, new_tokens)
         end_time = time.perf_counter()
         update_time = end_time - start_time
 
@@ -258,8 +260,10 @@ def process_task(
                                     desc=f"Building cache"):
         # Use negative request_id to indicate training examples and avoid
         # conflicts with eval request_ids numbered 0, .., num_eval - 1.
-        suffix_cache.update_response(-1 - request_id, example["prompt"])
-        suffix_cache.update_response(-1 - request_id, example["response"])
+        # Use the real problem_id from data
+        problem_id = example["problem_id"]
+        suffix_cache.update_response(-1 - request_id, problem_id, example["prompt"])
+        suffix_cache.update_response(-1 - request_id, problem_id, example["response"])
 
     # # Visualize the suffix tree after building
     # if enable_visualization and SuffixTreeVisualizer is not None:
@@ -319,9 +323,12 @@ def process_task(
     for request_id, example in tqdm(eval_subset.iterrows(),
                                     total=len(eval_subset),
                                     desc=f"Running requests"):
+        # Use the real problem_id from data
+        problem_id = example["problem_id"]
         results = suffix_decode(
             suffix_cache,
             request_id,
+            problem_id,
             example["prompt"],
             example["response"],
             max_spec_tokens,
@@ -436,12 +443,22 @@ def read_data_file(
         raise ValueError(f"Column '{prompt_column}' not found in dataset")
     if response_column not in df.columns:
         raise ValueError(f"Column '{response_column}' not found in dataset")
-    # Drop all columns except the prompt and response columns.
-    df = df[[prompt_column, response_column]]
-    return df.rename(columns={
-        prompt_column: "prompt",
-        response_column: "response",
-    })
+    # Keep problem_id if it exists, otherwise create a default one
+    if "problem_id" in df.columns:
+        df = df[[prompt_column, response_column, "problem_id"]]
+        return df.rename(columns={
+            prompt_column: "prompt",
+            response_column: "response",
+            "problem_id": "problem_id",
+        })
+    else:
+        # If no problem_id in data, create default ones
+        df = df[[prompt_column, response_column]]
+        df["problem_id"] = [f"default_prob_{i}" for i in range(len(df))]
+        return df.rename(columns={
+            prompt_column: "prompt", 
+            response_column: "response",
+        })
 
 
 def tokenize_data(dataset: pd.DataFrame, tokenizer_name: str) -> pd.DataFrame:
