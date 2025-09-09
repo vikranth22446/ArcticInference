@@ -24,9 +24,25 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g3 -ggdb")
 
+# Debug visualization option
+option(DEBUG_VISUALIZATION "Enable debug visualization for suffix trees" OFF)
+
+if(DEBUG_VISUALIZATION)
+    message(STATUS "DEBUG_VISUALIZATION enabled")
+    add_definitions(-DDEBUG_VISUALIZATION)
+endif()
+
 find_package(pybind11 REQUIRED)
 
-pybind11_add_module(_C pybind.cc suffix_tree.cc)
+# Source files
+set(SOURCES pybind.cc suffix_tree.cc)
+
+# Add extractor sources if debug visualization is enabled
+if(DEBUG_VISUALIZATION)
+    list(APPEND SOURCES suffix_tree_extractor.cpp)
+endif()
+
+pybind11_add_module(_C ${SOURCES})
 
 # EXAMPLE_VERSION_INFO is defined by setup.py and passed into the C++ code as a
 # define (VERSION_INFO) here.

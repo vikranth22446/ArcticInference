@@ -78,6 +78,12 @@ class CMakeBuild(build_ext):
             arch_string = f"{major}.{minor}"
             cmake_args.append(f"-DTORCH_CUDA_ARCH_LIST={arch_string}")
 
+        # Enable debug visualization if requested
+        debug_viz_env = os.environ.get("DEBUG_VISUALIZATION", "").lower() in ("1", "true", "on")
+        if debug_viz_env:
+            cmake_args.append("-DDEBUG_VISUALIZATION=ON")
+            print("Arctic Inference: Enabling DEBUG_VISUALIZATION for suffix tree debugging")
+
         # Adding CMake arguments set as environment variable
         # (needed e.g. to build for ARM OSx on conda-forge)
         if "CMAKE_ARGS" in os.environ:

@@ -61,6 +61,14 @@ class EngineArgsPatch(ArcticPatch[EngineArgs]):
         return super(EngineArgs, cls).__new__(cls)
 
     def __post_init__(self):
+        # Handle cases where patching didn't work correctly
+        if not hasattr(self, 'ulysses_sequence_parallel_size'):
+            self.ulysses_sequence_parallel_size = 1
+        if not hasattr(self, 'enable_shift_parallel'):
+            self.enable_shift_parallel = False
+        if not hasattr(self, 'shift_parallel_threshold'):
+            self.shift_parallel_threshold = 512
+            
         # Explicitly set the distributed executor backend if ulysses is enabled
         # since the ulysses parameter is not passed to ParallelConfig.__init__,
         # which leads to the backend being defaulted incorrectly to "uni".
@@ -106,6 +114,14 @@ class EngineArgsPatch(ArcticPatch[EngineArgs]):
         return EngineArgsPatch._orig_from_cli_args(cls, args)
 
     def create_engine_config(self, *args, **kwargs):
+        # Handle cases where patching didn't work correctly
+        if not hasattr(self, 'ulysses_sequence_parallel_size'):
+            self.ulysses_sequence_parallel_size = 1
+        if not hasattr(self, 'enable_shift_parallel'):
+            self.enable_shift_parallel = False
+        if not hasattr(self, 'shift_parallel_threshold'):
+            self.shift_parallel_threshold = 512
+            
         if (self.ulysses_sequence_parallel_size > 1 and
                 self.distributed_executor_backend is None):
             self.distributed_executor_backend = "mp"

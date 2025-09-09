@@ -272,3 +272,20 @@ Candidate SuffixTree::_speculate_tree(Node* node, int idx,
     }
     return ret;
 }
+
+// 🆕 Thread-safe implementations with per-object locking
+
+void SuffixTree::append_safe(int seq_id, int token) {
+    std::lock_guard<std::mutex> lock(_tree_mutex);
+    append(seq_id, token);
+}
+
+void SuffixTree::extend_safe(int seq_id, const std::vector<int>& tokens) {
+    std::lock_guard<std::mutex> lock(_tree_mutex);
+    extend(seq_id, tokens);
+}
+
+int SuffixTree::num_seqs_safe() const {
+    std::lock_guard<std::mutex> lock(_tree_mutex);
+    return static_cast<int>(_seqs.size());
+}

@@ -114,13 +114,14 @@ class ArcticProposer:
     def prepare_hidden_states(
         self,
         sample_hidden_states: torch.Tensor,
-        sampled_token_ids: np.ndarray,
+        sampled_token_ids: Union[np.ndarray, list[list[int]]],
         spec_decode_metadata: SpecDecodeMetadata,
     ) -> torch.Tensor:
         if sample_hidden_states is not None:
             assert sample_hidden_states.shape[-1] == self.input_hidden_dim, \
                 f"hidden_states shape mismatch: {sample_hidden_states.shape[-1]} != {self.input_hidden_dim}. \
                 Please make sure spec model is trained using the same base model."
+        
 
         max_gen_len = sampled_token_ids.shape[-1]
         if max_gen_len == 1:
