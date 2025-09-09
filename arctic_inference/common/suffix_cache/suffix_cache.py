@@ -79,7 +79,6 @@ class SuffixCache:
         self._thread_safe = thread_safe
         self._max_threads = max_threads or min(8, threading.active_count() + 4)
         
-        #self._suffix_tree = SuffixTree(max_depth)
         self._problem_tree = {}
         self._prompt_trees = {}
         self._req_to_seq_id = {}
@@ -132,7 +131,6 @@ class SuffixCache:
             self._prompt_trees[req_id] = SuffixTree(self._max_depth)
             tree = self._prompt_trees[req_id]
         
-        # Use thread-safe methods if enabled
         if self._thread_safe:
             tree.extend_safe(0, prompt_token_ids)
         else:
@@ -163,7 +161,6 @@ class SuffixCache:
         Clear all cached data in the suffix cache to free up memory.
         This includes all problem trees, prompt trees, and request-to-sequence mappings.
         """
-        # Clear all problem trees (C++ SuffixTree objects)
         problem_ids_to_clear = list(self._problem_tree.keys())
         for problem_id in problem_ids_to_clear:
             try:
@@ -171,8 +168,6 @@ class SuffixCache:
             except KeyError:
                 pass  # Already cleared
         self._problem_tree.clear()
-        
-        # Clear all prompt trees (C++ SuffixTree objects)  
         prompt_req_ids_to_clear = list(self._prompt_trees.keys())
         for req_id in prompt_req_ids_to_clear:
             try:
@@ -276,7 +271,6 @@ class SuffixCache:
         
         tree = self._problem_tree[problem_id]
         
-        # Use thread-safe methods if enabled (with GIL release)
         if self._thread_safe:
             tree.extend_safe(seq_id, prompt_token_ids)
             tree.extend_safe(seq_id, token_ids)
@@ -333,7 +327,6 @@ class SuffixCache:
 
         if max_spec_tokens is None:
             max_spec_tokens = self.max_depth
-        #max_spec_offset = -1
 
         if len(pattern) > self._max_depth:
             pattern = pattern[-self._max_depth :]
@@ -341,7 +334,6 @@ class SuffixCache:
 
         if use_cached_prompt:
             prompt_tree = self._prompt_trees[req_id]
-            # Use thread-safe speculate if available (though speculate is typically read-only)
             candidate = prompt_tree.speculate(
                 pattern,
                 max_spec_tokens,
@@ -353,7 +345,6 @@ class SuffixCache:
         else:
             result = SuffixSpecResult()
 
-        # Thread-safe access to problem tree (no need for _safe method as speculate is read-only)
         problem_tree = self._problem_tree[problem_id]
         candidate = problem_tree.speculate(
             pattern,
@@ -366,8 +357,6 @@ class SuffixCache:
             result = SuffixSpecResult.from_candidate(candidate)
         return result
 
-    # 🆕 Thread-safe parallel processing methods using C++ object-level locking
-    
     def prebuild_problems_parallel(
         self, 
         problems_data: List[Tuple[Hashable, List[int], List[List[int]]]]
@@ -388,7 +377,6 @@ class SuffixCache:
             Dictionary with performance statistics
         """
         if not self._thread_safe:
-            # Fallback to serial processing
             return self._build_problems_serial(problems_data)
         
         if not problems_data:
@@ -414,7 +402,6 @@ class SuffixCache:
             for problem_id, prompt_tokens, sequences in group_data:
                 for i, token_ids in enumerate(sequences):
                     seq_id = -i-1
-                    # ⚡ Key: This calls our C++ thread-safe methods with GIL release!
                     self.prebuild_problemtree(seq_id, problem_id, prompt_tokens, token_ids)
                     operations += 2  # extend prompt + extend tokens
                 processed += 1
@@ -425,15 +412,13 @@ class SuffixCache:
                 'time': time.perf_counter() - thread_start
             }
         
-        # Execute threads in parallel
         with ThreadPoolExecutor(max_workers=len([g for g in thread_groups if g])) as executor:
             futures = []
             for i, group in enumerate(thread_groups):
-                if group:  # Only submit non-empty groups
+                if group:
                     future = executor.submit(process_thread_group, group)
                     futures.append(future)
             
-            # Collect results with progress bar
             results = []
             for future in tqdm(as_completed(futures), total=len(futures), 
                               desc="Building with C++ object-level locking"):
@@ -514,7 +499,6 @@ class SuffixCache:
         }
         
         if self._thread_safe:
-            # Get thread-safe counts
             total_seqs = 0
             for tree in self._problem_tree.values():
                 try:
