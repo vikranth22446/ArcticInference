@@ -71,6 +71,62 @@ HARD_PROBLEMS = {
 ENABLE_HARD_PROBLEMS_ONLY_SUFFIX = os.getenv("ENABLE_HARD_PROBLEMS_ONLY_SUFFIX", "false").lower() == "true"
 
 
+def classify_request_indices(req_ids, reqid_to_problemid, hard_problems_set):
+    hard, non_hard = [], []
+    for i, req_id in enumerate(req_ids):
+        pid = reqid_to_problemid.get(req_id)
+        (hard if str(pid) in hard_problems_set else non_hard).append(i)
+    return hard, non_hard
+
+def sum_tokens_at_indices(spec_token_ids, indices):
+    total = 0
+    for i in indices:
+        if i < len(spec_token_ids) and spec_token_ids[i] is not None:
+            total += len(spec_token_ids[i])
+    return total
+
+def proportional_keep_count(length, ratio, min_keep):
+    return max(min_keep, int(length * ratio))
+
+def apply_hard_overflow_strategy(spec_token_ids, hard_indices, keep_ratio):
+    hard_set = set(hard_indices)
+    out = []
+    for i, toks in enumerate(spec_token_ids):
+        if i in hard_set:
+            if toks:  # not None and not empty
+                k = proportional_keep_count(len(toks), keep_ratio, 1)
+                out.append(toks[:k])
+            else:
+                out.append(toks)
+        else:
+            out.append([])
+    return out
+
+def apply_non_hard_allocation_strategy(spec_token_ids, hard_indices, remaining_quota):
+    hard_set = set(hard_indices)
+    non_hard_indices = [i for i in range(len(spec_token_ids)) if i not in hard_set]
+    non_hard_total = sum_tokens_at_indices(spec_token_ids, non_hard_indices)
+
+    # Match original behavior: if no remaining quota, drop all NON-HARD; if NON-HARD has zero tokens,
+    # leave the structure unchanged (preserve None vs []).
+    if remaining_quota <= 0:
+        return [t if i in hard_set else [] for i, t in enumerate(spec_token_ids)]
+    if non_hard_total == 0:
+        return spec_token_ids
+
+    ratio = min(1.0, remaining_quota / non_hard_total)
+    out = []
+    for i, toks in enumerate(spec_token_ids):
+        if i in hard_set:
+            out.append(toks)
+        elif toks:
+            k = proportional_keep_count(len(toks), ratio, 0)
+            out.append(toks[:k] if k > 0 else [])
+        else:
+            out.append(toks)  # preserve None / empty
+    return out
+
+
 def is_hard_problem(problem_id: Optional[str]) -> bool:
     """Return True if the given problem_id is configured as hard.
 
@@ -152,17 +208,6 @@ class ProblemIdContextManager:
             return {}
         return _problem_id_context.data.get('req_id_to_problem_id', {})
     
-    # @staticmethod
-    # def get_problem_id_for_index(index: int) -> Optional[str]:
-    #     """Get problem_id for a specific index."""
-    #     if not hasattr(_problem_id_context, 'data'):
-    #         return None
-        
-    #     problem_ids = _problem_id_context.data.get('problem_ids', [])
-    #     if 0 <= index < len(problem_ids):
-    #         return problem_ids[index]
-    #     return None
-    
     @staticmethod
     def get_problem_id_for_req_id(req_id: str) -> Optional[str]:
         """Get problem_id for a specific req_id."""
@@ -183,6 +228,30 @@ class ProblemIdContextManager:
         """Clear only the req_id mapping, keep problem_ids."""
         if hasattr(_problem_id_context, 'data'):
             _problem_id_context.data.pop('req_id_to_problem_id', None)
+    
+    @staticmethod
+    def set_dynamic_config(hard_problems=None, max_quota=None):
+        """Set dynamic configuration for hard problems and quota."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        if hard_problems is not None:
+            _problem_id_context.data['hard_problems'] = hard_problems
+        if max_quota is not None:
+            _problem_id_context.data['max_quota'] = max_quota
+    
+    @staticmethod
+    def get_dynamic_hard_problems():
+        """Get dynamic hard problems configuration."""
+        if not hasattr(_problem_id_context, 'data'):
+            return None
+        return _problem_id_context.data.get('hard_problems')
+    
+    @staticmethod
+    def get_dynamic_max_quota():
+        """Get dynamic max quota configuration."""
+        if not hasattr(_problem_id_context, 'data'):
+            return None
+        return _problem_id_context.data.get('max_quota')
     
     @staticmethod
     @contextlib.contextmanager
@@ -305,20 +374,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
                 self.rejection_sampler = RejectionSampler()
 
-        # if (self.speculative_config is not None and
-        #         self.speculative_config.enable_suffix_decoding):
-        #     if self.speculative_config.method not in (
-        #             "arctic", "suffix", "mlp_speculator"):
-        #         raise ValueError(
-        #             "Suffix decoding is only supported with the 'arctic', "
-        #             "'mlp_speculator' or 'suffix' spec decoding methods.")
-        #     self._suffix_cache = SuffixCache(self.speculative_config.suffix_cache_max_depth)
-            # print(f"DEBUG: Initialized suffix cache with max_depth={self.speculative_config.suffix_cache_max_depth}")
-            # print(f"DEBUG: ENABLE_HARD_PROBLEMS_ONLY_SUFFIX={ENABLE_HARD_PROBLEMS_ONLY_SUFFIX}")
-            # print(f"DEBUG: HARD_PROBLEMS={HARD_PROBLEMS}")
-            # Optionally bootstrap the suffix cache with provided sequences so
-            # that multiple LLM instances can share the same logical suffix tree
-            # contents without passing non-picklable objects across processes.
 # #    ---- Timing buffered writer (to reduce I/O) ----
         import os as _os
         import time as _time
@@ -426,11 +481,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         rank = os.getenv("RANK", "0")
         
         self._update_states(scheduler_output)
-
-        # torch.cuda.synchronize()
-        # execution_start_time = time.perf_counter()
-        # execution_start_timestamp = datetime.now().isoformat()
-        
         # Extract problem_ids for the current batch at the very beginning
         # Build req_id to problem_id mapping for the current batch
         self._current_batch_req_id_to_problem_id = {}
@@ -458,8 +508,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 self._current_batch_req_id_to_problem_id[req_id] = problem_id
                 self._current_batch_problem_ids.append(problem_id)
                 
-            # Log the mapping for debugging (optional)
-            # print(f"DEBUG: execute_model batch mapping: {self._current_batch_req_id_to_problem_id}")
         else:
             batch_size = 0
 
@@ -730,11 +778,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
 
-        ### profiling suffix_tree_stats: now may have bug 
-        self._log_suffix_tree_stats(num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
-
-        #print(f"DEBUG: sampled_token_ids: {sampled_token_ids}")
-            
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
         # NOTE(woosuk): As an exception, when using PP, the scheduler sends
@@ -767,12 +810,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             self._update_suffix_cache(valid_sampled_token_ids)
 
 
-        ### profiling suffix tree decoding
-        # torch.cuda.synchronize()
-        # execution_start_time = time.perf_counter()
-        # execution_start_timestamp = datetime.now().isoformat()
-        
-
         if not self.speculative_config:
             # Speculative decoding is not enabled.
             spec_token_ids = None
@@ -788,121 +825,30 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 spec_decode_metadata,
                 attn_metadata,
             )
+            # Get dynamic configuration or use defaults
+            dynamic_hard_problems = ProblemIdContextManager.get_dynamic_hard_problems()
+            dynamic_max_quota = ProblemIdContextManager.get_dynamic_max_quota()
             
-            # # # # # 统计和控制 spec_token 数量
-            # if spec_token_ids is not None:
-            #     # 统计总的 spec_token 数量
-            #     total_spec_tokens = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
-                
-            #     # 如果数量超过128，按比例删除一部分
-            #     if total_spec_tokens > 200:
-            #         # 计算需要保留的比例
-            #         keep_ratio = 200 / total_spec_tokens
-                    
-            #         # 对每个子列表按比例保留 tokens
-            #         filtered_spec_token_ids = []
-            #         for tokens in spec_token_ids:
-            #             if tokens is not None and len(tokens) > 0:
-            #                 # 计算当前子列表需要保留的数量
-            #                 keep_count = max(1, int(len(tokens) * keep_ratio))  # 至少保留1个
-            #                 # 保留前 keep_count 个 tokens
-            #                 filtered_tokens = tokens[:keep_count]
-            #                 filtered_spec_token_ids.append(filtered_tokens)
-            #             else:
-            #                 filtered_spec_token_ids.append(tokens)
-                    
-            #         spec_token_ids = filtered_spec_token_ids
-                    
-                   # 记录统计信息（可选）
-                    # filtered_total = sum(len(tokens) for tokens in spec_token_ids if tokens is not None)
-                    # print(f"Spec tokens reduced: {total_spec_tokens} -> {filtered_total} (ratio: {keep_ratio:.3f})")
-        # execution_end_time = time.perf_counter()
-        # execution_duration = execution_end_time - execution_start_time
-        # self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
-        #                         scheduler_output.total_num_scheduled_tokens, early_return=False)
-
-                    # # # # 统计和控制 spec_token 数量
+            current_hard_problems = dynamic_hard_problems if dynamic_hard_problems is not None else HARD_PROBLEMS
+            MAX_SPEC_QUOTA = dynamic_max_quota if dynamic_max_quota is not None else 160
+            
             if spec_token_ids is not None:
-                # 分类请求：HARD_PROBLEMS vs 非HARD_PROBLEMS
-                hard_indices = []
-                non_hard_indices = []
-                
-                for i, req_id in enumerate(self.input_batch.req_ids):
-                    problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
-                    if str(problem_id) in HARD_PROBLEMS:
-                        hard_indices.append(i)
-                    else:
-                        non_hard_indices.append(i)
-                
-                # 统计HARD_PROBLEMS的spec_tokens数量
-                hard_spec_tokens = 0
-                for i in hard_indices:
-                    if i < len(spec_token_ids) and spec_token_ids[i] is not None:
-                        hard_spec_tokens += len(spec_token_ids[i])
-                
-                # 根据HARD_PROBLEMS的tokens数量决定策略
-                if hard_spec_tokens > 160:
-                    # 策略1: HARD_PROBLEMS超过200，按比例削减HARD_PROBLEMS，删除所有非HARD_PROBLEMS
-                    keep_ratio = 160 / hard_spec_tokens
-                    
-                    filtered_spec_token_ids = []
-                    for i in range(len(spec_token_ids)):
-                        if i in hard_indices:
-                            # HARD_PROBLEMS请求：按比例削减
-                            if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
-                                keep_count = max(1, int(len(spec_token_ids[i]) * keep_ratio))
-                                filtered_tokens = spec_token_ids[i][:keep_count]
-                                filtered_spec_token_ids.append(filtered_tokens)
-                            else:
-                                filtered_spec_token_ids.append(spec_token_ids[i])
-                        else:
-                            # 非HARD_PROBLEMS请求：删除所有spec_tokens
-                            filtered_spec_token_ids.append([])
-                    
-                    spec_token_ids = filtered_spec_token_ids
-                    
+                hard_indices, non_hard_indices = classify_request_indices(
+                    self.input_batch.req_ids,
+                    self._current_batch_req_id_to_problem_id,
+                    current_hard_problems,
+                )
+                hard_spec_tokens = sum_tokens_at_indices(spec_token_ids, hard_indices)
+                if hard_spec_tokens > MAX_SPEC_QUOTA:
+                    keep_ratio = MAX_SPEC_QUOTA / hard_spec_tokens
+                    spec_token_ids = apply_hard_overflow_strategy(
+                        spec_token_ids, hard_indices, keep_ratio
+                    )
                 else:
-                    # 策略2: HARD_PROBLEMS未超过200，保持HARD_PROBLEMS不变，给非HARD_PROBLEMS分配剩余配额
-                    remaining_quota = 160 - hard_spec_tokens
-                    
-                    # 统计非HARD_PROBLEMS的原始tokens数量
-                    non_hard_spec_tokens = 0
-                    for i in non_hard_indices:
-                        if i < len(spec_token_ids) and spec_token_ids[i] is not None:
-                            non_hard_spec_tokens += len(spec_token_ids[i])
-                    
-                    if non_hard_spec_tokens > 0 and remaining_quota > 0:
-                        # 计算非HARD_PROBLEMS的缩放比例
-                        non_hard_ratio = min(1.0, remaining_quota / non_hard_spec_tokens)
-                        
-                        filtered_spec_token_ids = []
-                        for i in range(len(spec_token_ids)):
-                            if i in hard_indices:
-                                # HARD_PROBLEMS请求：保持不变
-                                filtered_spec_token_ids.append(spec_token_ids[i])
-                            else:
-                                # 非HARD_PROBLEMS请求：按比例缩放
-                                if spec_token_ids[i] is not None and len(spec_token_ids[i]) > 0:
-                                    keep_count = max(0, int(len(spec_token_ids[i]) * non_hard_ratio))
-                                    if keep_count > 0:
-                                        filtered_tokens = spec_token_ids[i][:keep_count]
-                                        filtered_spec_token_ids.append(filtered_tokens)
-                                    else:
-                                        filtered_spec_token_ids.append([])
-                                else:
-                                    filtered_spec_token_ids.append(spec_token_ids[i])
-                        
-                        spec_token_ids = filtered_spec_token_ids
-                    elif remaining_quota <= 0:
-                        # 剩余配额不足，删除所有非HARD_PROBLEMS的spec_tokens
-                        filtered_spec_token_ids = []
-                        for i in range(len(spec_token_ids)):
-                            if i in hard_indices:
-                                filtered_spec_token_ids.append(spec_token_ids[i])
-                            else:
-                                filtered_spec_token_ids.append([])
-                        
-                        spec_token_ids = filtered_spec_token_ids
+                    remaining_quota = MAX_SPEC_QUOTA - hard_spec_tokens
+                    spec_token_ids = apply_non_hard_allocation_strategy(
+                        spec_token_ids, hard_indices, remaining_quota
+                    )
 
         # Clear KVConnector state after all KVs are generated.
         if has_kv_transfer_group():
@@ -1153,7 +1099,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             if not sampled_ids:
                 continue
 
-            #print(f"DEBUG: Updating suffix cache for hard problem req_id={req_id}, sampled_ids={sampled_ids}")
             
             index = self.input_batch.req_id_to_index[req_id]
             if not self._suffix_cache.has_cached_prompt(req_id):
@@ -1166,22 +1111,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             #print(f"DEBUG: Updating response for req_id={req_id} with {len(sampled_ids)} tokens")
             self._suffix_cache.update_response(req_id, problem_id,sampled_ids)
 
-        # # Evict prompts that are not seen to prevent memory leaks
-        # for req_id in self._suffix_cache.cached_prompt_ids():
-        #     if req_id not in seen_req_ids:
-        #         try:
-        #             self._suffix_cache.evict_prompt(req_id)
-        #         except ValueError:
-        #             # Already evicted
-        #             pass
-        # for problem_id in self._current_batch_problem_ids:
-        #     if problem_id not in seen_problem_ids:
-        #         try:
-        #             self._suffix_cache.evict_problem(problem_id)
-        #         except ValueError:
-        #             # Already evicted
-        #             pass
-
 
     def propose_suffix_draft_token_ids(
         self,
@@ -1190,16 +1119,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     ) -> list[list[int]]:
         config = self.speculative_config
         results = []
-        
-        # # Initialize debug file for this rank if not already done
-        # if not hasattr(self, '_debug_spec_file'):
-        #     rank = os.getenv("RANK", "0")
-        #     local_rank = os.getenv("LOCAL_RANK", "0") 
-        #     debug_dir = os.getenv("ARCTIC_METRICS_DIR", "/app/src")
-        #     os.makedirs(debug_dir, exist_ok=True)
-        #     debug_file_path = os.path.join(debug_dir, f"spec_debug_rank_{rank}_local_{local_rank}.jsonl")
-        #     self._debug_spec_file = open(debug_file_path, 'w', encoding='utf-8')
-        #     self._step_counter = 0
         
         for i, sampled_ids in enumerate(sampled_token_ids):
             spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
@@ -1226,11 +1145,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 #                                  start_idx]
                 continue
 
-            # Check what's already at the position before writing
-            # existing_token = self.input_batch.token_ids_cpu[i, start_idx-6:start_idx].tolist() if start_idx < self.input_batch.token_ids_cpu.shape[1] else []
-            # print(f"DEBUG:start_idx: {start_idx}, end_idx: {end_idx}")
-            # print(f"DEBUG:existing_token: {existing_token}, sampled_ids: {sampled_ids}")
-            
             # self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
 
             size = min(end_idx, config.suffix_cache_max_depth)
@@ -1264,61 +1178,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 max_spec_factor=max_spec_factor,
                 max_spec_offset=max_spec_offset,
                 min_token_prob=config.suffix_min_token_prob)
-
-            # # Debug output - capture match and spec token information
-            # if hasattr(self, '_debug_spec_file') and self._debug_spec_file:
-            #     self._step_counter += 1
-            #     
-            #     # Extract match tokens from pattern based on match length
-            #     match_tokens = pattern[-result.match_len:] if result.match_len > 0 else []
-            #     match_text = ""
-            #     if self._tokenizer and match_tokens:
-            #         try:
-            #             match_text = self._tokenizer.decode(match_tokens, skip_special_tokens=True)
-            #         except:
-            #             match_text = ""
-            #     
-            #     # Spec tokens from result
-            #     spec_tokens = result.token_ids if hasattr(result, 'token_ids') else []
-            #     spec_text = ""
-            #     if self._tokenizer and spec_tokens:
-            #         try:
-            #             spec_text = self._tokenizer.decode(spec_tokens, skip_special_tokens=True)
-            #         except:
-            #             spec_text = ""
-            #     
-            #     # Pattern tokens (the search pattern used)
-            #     pattern_text = ""
-            #     if self._tokenizer and pattern:
-            #         try:
-            #             pattern_text = self._tokenizer.decode(pattern, skip_special_tokens=True)
-            #         except:
-            #             pattern_text = ""
-            #     
-            #     # Create debug data similar to simulator
-            #     debug_data = {
-            #         "request_id": req_id,
-            #         "step": self._step_counter,
-            #         "batch_index": i,
-            #         "pattern": pattern,
-            #         "pattern_text": pattern_text,
-            #         "pattern_length": len(pattern),
-            #         "match_tokens": match_tokens,
-            #         "match_text": match_text,
-            #         "match_length": result.match_len,
-            #         "spec_tokens": spec_tokens,
-            #         "spec_text": spec_text,
-            #         "num_spec_tokens": len(spec_tokens),
-            #         "sampled_tokens": sampled_ids,
-            #         "existing_spec_tokens": spec_ids,
-            #         "score": getattr(result, 'score', 0.0),
-            #         "max_spec_tokens": max_spec_tokens,
-            #         "max_spec_factor": max_spec_factor,
-            #         "max_spec_offset": max_spec_offset
-            #     }
-            #     
-            #     self._debug_spec_file.write(json.dumps(debug_data, ensure_ascii=False) + '\n')
-            #     self._debug_spec_file.flush()
 
             results.append(result)
 
@@ -1451,6 +1310,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             for mod in self.shift_model.modules():
                 if isinstance(mod, Attention):
                     mod.kv_cache = forward_context[mod.layer_name].kv_cache
+
+
+# -- Debug and metrics logging utilities --
+
     def _log_execution_time(self, start_timestamp, duration_seconds, batch_size, num_scheduled_tokens,early_return=False):
         """Log execution time metrics for execute_model calls"""
         try:
@@ -1529,8 +1392,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         """Log suffix tree decoding statistics for this execute_model call"""
         if not hasattr(self, 'input_batch') or not self.input_batch:
             return
-        #print(f"DEBUG: draft_token_ids={draft_token_ids},\n")
-        
         # Count total proposed and accepted tokens for this call
         total_proposed = 0
         total_accepted = 0
@@ -1582,47 +1443,25 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         else:
             self._debug_call_count = 1
             
-        # # Log debug info for first few calls
-        # if self._debug_call_count <= 5:
-        #     if len(valid_sampled_token_ids) > 0:
-        #         sample_tokens = valid_sampled_token_ids[0] if len(valid_sampled_token_ids) > 0 else []
-        #         total_tokens = len(sample_tokens)
-        #         spec_tokens = max(0, total_tokens - 1)  # Calculate spec tokens (total - 1)
-        #         # print(f"DEBUG Call {self._debug_call_count}: valid_sampled_token_ids[0] = {sample_tokens[:20] if len(sample_tokens) > 20 else sample_tokens}")
-        #         # print(f"DEBUG Call {self._debug_call_count}: valid_tokens[0] length = {total_tokens}, spec_tokens = {spec_tokens}")
-            
-            
-        #     draft_sample = draft_token_ids
-        #     #print(f"DEBUG Call {self._debug_call_count}: draft_token_ids (first 20) = {draft_sample.shape}")
-            
-        #     if num_draft_tokens:
-        #         print(f"DEBUG Call {self._debug_call_count}: num_draft_tokens = {num_draft_tokens}")
-        #     print(f"DEBUG Call {self._debug_call_count}: total_proposed = {total_proposed}, total_accepted = {total_accepted}")
-
-        # Only log if there were spec tokens proposed
-        if True:
-            stats_data = {
-                "timestamp": datetime.now().isoformat(),
-                "call_type": "execute_model_suffix_tree",
-                "batch_size": len(self.input_batch.req_ids),
-                "total_proposed": total_proposed,
-                "total_accepted": total_accepted,
-                "accept_rate": total_accepted / total_proposed * 100 if total_proposed > 0 else 0,
-                "per_request_stats": per_request_stats,
-                "process_info": {
-                    "rank": int(os.getenv("RANK", "0")),
-                    "local_rank": int(os.getenv("LOCAL_RANK", "0")),
-                    "world_size": int(os.getenv("WORLD_SIZE", "1"))
-                }
+        stats_data = {
+            "timestamp": datetime.now().isoformat(),
+            "call_type": "execute_model_suffix_tree",
+            "batch_size": len(self.input_batch.req_ids),
+            "total_proposed": total_proposed,
+            "total_accepted": total_accepted,
+            "accept_rate": total_accepted / total_proposed * 100 if total_proposed > 0 else 0,
+            "per_request_stats": per_request_stats,
+            "process_info": {
+                "rank": int(os.getenv("RANK", "0")),
+                "local_rank": int(os.getenv("LOCAL_RANK", "0")),
+                "world_size": int(os.getenv("WORLD_SIZE", "1"))
             }
-            
-            # Write to file
-            self._write_suffix_tree_stats(stats_data)
-            #print("DEBUG:len(draft_token_ids): ", len(draft_token_ids))
-            #print("DEBUG:cu_num_draft_tokens: ", len(cu_num_draft_tokens),cu_num_draft_tokens[:5])
-            
-            # Write token data to separate file
-            self._write_token_data_to_file(draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
+        }
+        
+        # Write to file
+        self._write_suffix_tree_stats(stats_data)
+        # Write token data to separate file
+        self._write_token_data_to_file(draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
     
     def _write_suffix_tree_stats(self, stats_data):
         """Write suffix tree decoding statistics to file with conflict avoidance"""

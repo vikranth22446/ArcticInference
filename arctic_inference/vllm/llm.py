@@ -19,7 +19,7 @@ class LLMPatch:
 
 
 def apply_llm_patches():
-    """Apply LLM patches for problem_id support."""
+    """Apply LLM patches for problem_id support and dynamic configuration."""
     try:
         from vllm.entrypoints.llm import LLM
         
@@ -54,6 +54,10 @@ def apply_llm_patches():
             if isinstance(problem_ids, str):
                 problem_ids = [problem_ids]
             
+            # Get configuration from LLM instance
+            hard_problems = getattr(llm_self, '_arctic_hard_problems', None)
+            max_quota = getattr(llm_self, '_arctic_max_spec_quota', None)
+            
             # If problem_ids provided, initialize context
             if problem_ids is not None:
                 # Clear any existing mapping and set up new context
@@ -62,6 +66,10 @@ def apply_llm_patches():
                 logger.debug(f"Setting up problem_ids context with {len(problem_ids)} IDs")
             else:
                 print(f"in generate_patch: DEBUG: problem_ids is None")
+            
+            # Set dynamic configuration in context
+            if hard_problems is not None or max_quota is not None:
+                ProblemIdContextManager.set_dynamic_config(hard_problems, max_quota)
             
             # === Re-implement original generate logic but use patched methods ===
             
@@ -240,9 +248,19 @@ def apply_llm_patches():
             # Return None (same as original method)
             return None
         
+        def set_hard_problems(llm_self, hard_problems):
+            """Set hard problems dynamically - stored in LLM instance."""
+            llm_self._arctic_hard_problems = set(hard_problems)
+        
+        def set_max_spec_quota(llm_self, quota):
+            """Set maximum speculative token quota - stored in LLM instance."""
+            llm_self._arctic_max_spec_quota = quota
+        
         LLM.generate = generate_patch
         LLM._validate_and_add_requests = validate_and_add_requests_patch
         LLM._add_request = add_request_patch
+        LLM.set_hard_problems = set_hard_problems
+        LLM.set_max_spec_quota = set_max_spec_quota
         
         # Mark as patched
         LLM._arctic_problem_id_patched = True
