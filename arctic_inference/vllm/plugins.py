@@ -61,6 +61,18 @@ class WorkerBasePatch(ArcticPatch[WorkerBase]):
         GPUModelRunnerPatch.apply_patch()
 
         return self._orig_init(*args, **kwargs)
+    
+    def atomic_update_req_id_mapping(self, request_id: str, problem_id: str):
+        """Proxy method to delegate to model_runner."""
+        return self.model_runner.atomic_update_req_id_mapping(request_id, problem_id)
+    
+    def set_dynamic_config(self, hard_problems, max_quota):
+        """Proxy method to delegate to model_runner."""
+        return self.model_runner.set_dynamic_config(hard_problems, max_quota)
+    
+    def clear_problem_id_cache(self):
+        """Proxy method to delegate to model_runner."""
+        return self.model_runner.clear_problem_id_cache()
 
 
 def arctic_inference_plugin():
@@ -114,7 +126,9 @@ def arctic_inference_plugin():
     
     # Apply LLM patches for problem_id support (early application)
     from arctic_inference.vllm.llm import apply_llm_patches
+    from arctic_inference.vllm.async_llm import apply_async_llm_patches
     apply_llm_patches()
+    apply_async_llm_patches()
 
     # Patches to vLLM arguments and configuration objects.
     EngineArgsPatch.apply_patch()

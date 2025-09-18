@@ -173,8 +173,9 @@ def is_shift_parallel_mode() -> bool:
     return SP_TP_MODE is True
 
 
-# Thread-local storage for problem_ids context
+# Thread-local storage for problem_ids context and global lock for atomic operations
 _problem_id_context = threading.local()
+_problem_id_context_lock = threading.Lock()
 
 
 class ProblemIdContextManager:
@@ -218,6 +219,17 @@ class ProblemIdContextManager:
         return mapping.get(req_id)
     
     @staticmethod
+    def atomic_update_req_id_mapping(req_id: str, problem_id: Optional[str]):
+        """Atomically update req_id to problem_id mapping."""
+        with _problem_id_context_lock:
+            if not hasattr(_problem_id_context, 'data'):
+                _problem_id_context.data = {}
+            
+            current_mapping = _problem_id_context.data.get('req_id_to_problem_id', {})
+            current_mapping[req_id] = problem_id
+            _problem_id_context.data['req_id_to_problem_id'] = current_mapping
+    
+    @staticmethod
     def clear_context():
         """Clear the current context."""
         if hasattr(_problem_id_context, 'data'):
@@ -238,6 +250,13 @@ class ProblemIdContextManager:
             _problem_id_context.data['hard_problems'] = hard_problems
         if max_quota is not None:
             _problem_id_context.data['max_quota'] = max_quota
+    
+    @staticmethod
+    def set_hard_problems(hard_problems):
+        """Set hard problems only."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        _problem_id_context.data['hard_problems'] = hard_problems
     
     @staticmethod
     def get_dynamic_hard_problems():
@@ -352,11 +371,13 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             # after the child class has been initialized.
             arctic_speculative_config = vllm_config.speculative_config
             vllm_config.speculative_config = None
+            print("Speculative decoding enabled with method:",
+                    arctic_speculative_config.method)
         else:
             arctic_speculative_config = None
 
         self._orig_init(vllm_config, device)
-
+        self.acceptance_length_per_problem = {}
         # Set up speculative decoding.
         self._suffix_cache = None
         if arctic_speculative_config is not None:
@@ -777,6 +798,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # Mask out the sampled tokens that should not be sampled.
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
+        self._log_suffix_tree_stats(num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -1183,6 +1205,74 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
         return results
 
+    def set_suffix_cache(self, suffix_cache):
+        """Set the suffix cache for speculative decoding."""
+        logger.debug("Updated Suffix Cache")
+        self._suffix_cache = suffix_cache
+    
+    def atomic_update_req_id_mapping(self, request_id: str, problem_id: str):
+        """Update problem_id mapping via RPC from AsyncLLM."""
+        ProblemIdContextManager.atomic_update_req_id_mapping(request_id, problem_id)
+    
+    def set_dynamic_config(self, hard_problems, max_quota):
+        """Set dynamic config via RPC from AsyncLLM."""
+        ProblemIdContextManager.set_dynamic_config(hard_problems, max_quota)
+    
+    def set_hard_problems(self, hard_problems):
+        """Set hard problems via RPC from AsyncLLM."""
+        ProblemIdContextManager.set_hard_problems(hard_problems)
+    
+    def clear_problem_id_cache(self):
+        """Clear problem ID cache via RPC from AsyncLLM."""
+        ProblemIdContextManager.clear_req_id_mapping()
+    
+    def add_acceptance_length(self, problem_id: str, acceptance_length: int):
+        """Add an acceptance length for a given problem_id."""
+        if problem_id not in self.acceptance_length_per_problem:
+            self.acceptance_length_per_problem[problem_id] = {
+                'acceptance_length': [],
+                'avg_acceptance_length': 0.0
+            }
+        
+        data = self.acceptance_length_per_problem[problem_id]
+        data['acceptance_length'].append(acceptance_length)
+        length = len(data['acceptance_length'])
+        if length == 1:
+            data['avg_acceptance_length'] = float(acceptance_length)
+        else:
+            old_avg = data['avg_acceptance_length']
+            data['avg_acceptance_length'] = ((length - 1) * old_avg + acceptance_length) / length
+    
+    def get_acceptance_length_metric_for_problems(self, problem_ids: list[str]) -> dict:
+        """Get metrics for given problem_ids.
+        
+        Args:
+            problem_ids: List of problem IDs to get metrics for
+            
+        Returns:
+            Dict with structure: {
+                'avg_acceptance_length': float,
+                'problem_metrics': {problem_id: {acceptance_length: [], avg_acceptance_length: float}}
+            }
+        """
+        problem_metrics = {}
+        avg_acceptance_lengths = []
+        for problem_id in problem_ids:
+            if problem_id in self.acceptance_length_per_problem:
+                avg_acceptance_length = self.acceptance_length_per_problem[problem_id]["avg_acceptance_length"]
+                avg_acceptance_lengths.append(avg_acceptance_length)
+        avg_acceptance_length = np.mean(avg_acceptance_lengths) if avg_acceptance_lengths else 0.0
+        return {
+            'avg_acceptance_length': avg_acceptance_length,
+            'problem_metrics': problem_metrics
+        }
+
+    def clear_acceptance_metrics_for_problems(self, problem_ids):
+        """Clear all acceptance length metrics."""
+        for problem_id in problem_ids:
+            if problem_id in self.acceptance_length_per_problem:
+                del self.acceptance_length_per_problem[problem_id]
+
     def __del__(self):
         """Clean up debug files when model runner is destroyed"""
         if hasattr(self, '_debug_spec_file') and self._debug_spec_file:
@@ -1429,6 +1519,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
             total_proposed += proposed_count
             total_accepted += accepted_count
+            
+            # Store acceptance length for this problem_id
+            problem_id = self.get_problem_id_by_request_id(req_id)
+            if problem_id is not None and accepted_count > 0:
+                self.add_acceptance_length(problem_id, accepted_count)
          
             # Record per-request stats
             per_request_stats.append({
@@ -1467,7 +1562,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         """Write suffix tree decoding statistics to file with conflict avoidance"""
         try:
             # Use environment variable for output directory
-            output_dir = os.getenv("ARCTIC_METRICS_DIR", "/app/src")
+            output_dir = os.getenv("ARCTIC_METRICS_DIR", "artic_logs/")
             os.makedirs(output_dir, exist_ok=True)
             
             # Get process info for filename

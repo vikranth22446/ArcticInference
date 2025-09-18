@@ -145,9 +145,10 @@ class EngineArgsPatch(ArcticPatch[EngineArgs]):
         if (self.speculative_config is not None and
                 self.speculative_config.get("method") in ("arctic", "suffix")):
             self.speculative_config = None
+        print("Speculative Config:", self.speculative_config)
 
         res = self._orig_is_v1_supported_oracle(*args, **kwargs)
-
+        
         self.speculative_config = orig_speculative_config
 
         return res

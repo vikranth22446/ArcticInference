@@ -53,8 +53,9 @@ def apply_llm_patches():
             # Convert single problem_id to list if needed
             if isinstance(problem_ids, str):
                 problem_ids = [problem_ids]
+            if isinstance(problem_ids, int):
+                problem_ids = [problem_ids]
             
-            # Get configuration from LLM instance
             hard_problems = getattr(llm_self, '_arctic_hard_problems', None)
             max_quota = getattr(llm_self, '_arctic_max_spec_quota', None)
             
@@ -252,6 +253,17 @@ def apply_llm_patches():
             """Set hard problems dynamically - stored in LLM instance."""
             llm_self._arctic_hard_problems = set(hard_problems)
         
+        def add_hard_problems(llm_self, problem_ids):
+            """Add problem IDs to the existing hard problems set incrementally."""
+            if not hasattr(llm_self, '_arctic_hard_problems') or llm_self._arctic_hard_problems is None:
+                llm_self._arctic_hard_problems = set()
+            
+            if isinstance(problem_ids, (str, int)):
+                problem_ids = [problem_ids]
+            
+            llm_self._arctic_hard_problems.update(problem_ids)
+            logger.debug(f"LLM: Added {len(problem_ids)} hard problems. Total: {len(llm_self._arctic_hard_problems)}")
+        
         def set_max_spec_quota(llm_self, quota):
             """Set maximum speculative token quota - stored in LLM instance."""
             llm_self._arctic_max_spec_quota = quota
@@ -260,6 +272,7 @@ def apply_llm_patches():
         LLM._validate_and_add_requests = validate_and_add_requests_patch
         LLM._add_request = add_request_patch
         LLM.set_hard_problems = set_hard_problems
+        LLM.add_hard_problems = add_hard_problems
         LLM.set_max_spec_quota = set_max_spec_quota
         
         # Mark as patched
