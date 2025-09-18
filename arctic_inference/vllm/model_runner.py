@@ -1207,8 +1207,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
     def set_suffix_cache(self, suffix_cache):
         """Set the suffix cache for speculative decoding."""
-        logger.debug("Updated Suffix Cache")
+        logger.info(f"Setting suffix cache: {suffix_cache is not None}, type: {type(suffix_cache)}")
         self._suffix_cache = suffix_cache
+        logger.info("Suffix cache updated successfully")
     
     def atomic_update_req_id_mapping(self, request_id: str, problem_id: str):
         """Update problem_id mapping via RPC from AsyncLLM."""

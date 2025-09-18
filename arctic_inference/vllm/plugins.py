@@ -74,6 +74,21 @@ class WorkerBasePatch(ArcticPatch[WorkerBase]):
         """Proxy method to delegate to model_runner."""
         return self.model_runner.clear_problem_id_cache()
 
+    def set_suffix_cache(self, suffix_cache):
+        """Wrapper method to set suffix cache on model runner."""
+        return self.model_runner.set_suffix_cache(suffix_cache)
+    
+    def set_hard_problems(self, hard_problems):
+        """Wrapper method to set hard problems on model runner."""
+        return self.model_runner.set_hard_problems(hard_problems)
+    
+    def get_acceptance_length_metric_for_problems(self, problem_ids):
+        """Wrapper method to get acceptance length metrics from model runner."""
+        return self.model_runner.get_acceptance_length_metric_for_problems(problem_ids)
+    
+    def clear_acceptance_metrics_for_problems(self, problem_ids):
+        """Wrapper method to clear acceptance metrics on model runner."""
+        return self.model_runner.clear_acceptance_metrics_for_problems(problem_ids)
 
 def arctic_inference_plugin():
     if (vllm.__version__ != get_compatible_vllm_version() and not
