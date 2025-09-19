@@ -335,6 +335,92 @@ def extract_problem_id_from_prompt(prompt) -> Optional[str]:
 
 
 
+class SuffixCacheWorkerManager:
+    def __init__(self, max_workers=2):
+        self._current_cache = None
+        self._current_generation_id = -1
+        self._prebuilt_caches = {}
+        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="SuffixCache")
+        self._lock = threading.Lock()
+        self._build_futures = {}
+        
+    def get_current_cache(self):
+        with self._lock:
+            return self._current_cache
+    
+    def get_current_generation_id(self):
+        with self._lock:
+            return self._current_generation_id
+    
+    def rebuild_cache_sync(self, generation_id, cache_params, problems_data):
+        if generation_id <= self._current_generation_id:
+            return False
+            
+        new_cache = SuffixCache(**cache_params)
+        if problems_data:
+            new_cache.prebuild_problems_parallel(problems_data)
+        
+        with self._lock:
+            old_cache = self._current_cache
+            self._current_cache = new_cache
+            self._current_generation_id = generation_id
+            
+            if old_cache:
+                self._executor.submit(old_cache.clear_all_cache)
+        return True
+    
+    def prebuild_cache_async(self, generation_id, cache_params, problems_data):
+        if generation_id in self._build_futures:
+            old_future = self._build_futures.pop(generation_id)
+            old_future.cancel()
+        
+        def _build():
+            try:
+                cache = SuffixCache(**cache_params)
+                if problems_data:
+                    cache.prebuild_problems_parallel(problems_data)
+                
+                with self._lock:
+                    self._prebuilt_caches[generation_id] = cache
+                return cache
+            except Exception as e:
+                logger.error(f"Failed to prebuild cache for generation {generation_id}: {e}")
+                return None
+            finally:
+                # Only remove if this is still the current future
+                current_future = self._build_futures.get(generation_id)
+                if current_future is future:
+                    self._build_futures.pop(generation_id, None)
+        
+        future = self._executor.submit(_build)
+        self._build_futures[generation_id] = future
+        return future
+    
+    def activate_prebuilt_cache(self, generation_id):
+        with self._lock:
+            if generation_id in self._prebuilt_caches:
+                old_cache = self._current_cache
+                self._current_cache = self._prebuilt_caches.pop(generation_id)
+                self._current_generation_id = generation_id
+                
+                if old_cache:
+                    self._executor.submit(old_cache.clear_all_cache)
+                return True
+        return False
+    
+    def shutdown(self):
+        for future in self._build_futures.values():
+            future.cancel()
+        self._executor.shutdown(wait=True)
+        
+        with self._lock:
+            if self._current_cache:
+                self._current_cache.clear_all_cache()
+            for cache in self._prebuilt_caches.values():
+                cache.clear_all_cache()
+            self._prebuilt_caches.clear()
+
+
 class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
     _orig_initialize_kv_cache = GPUModelRunner.initialize_kv_cache
@@ -380,6 +466,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self.acceptance_length_per_problem = {}
         # Set up speculative decoding.
         self._suffix_cache = None
+        self._suffix_cache_manager = SuffixCacheWorkerManager(max_workers=2)
         if arctic_speculative_config is not None:
             # Restore the speculative config.
             self.vllm_config.speculative_config = arctic_speculative_config
@@ -1208,8 +1295,28 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     def set_suffix_cache(self, suffix_cache):
         """Set the suffix cache for speculative decoding."""
         logger.info(f"Setting suffix cache: {suffix_cache is not None}, type: {type(suffix_cache)}")
-        self._suffix_cache = suffix_cache
+        with self._suffix_cache_manager._lock:
+            self._suffix_cache_manager._current_cache = suffix_cache
+            self._suffix_cache = suffix_cache
         logger.info("Suffix cache updated successfully")
+
+    def rebuild_cache_sync(self, generation_id, cache_params, problems_data):
+        changed = self._suffix_cache_manager.rebuild_cache_sync(generation_id, cache_params, problems_data)
+        if changed:
+            self._suffix_cache = self._suffix_cache_manager.get_current_cache()
+        return changed
+
+    def prebuild_cache_async(self, generation_id, cache_params, problems_data):
+        return self._suffix_cache_manager.prebuild_cache_async(generation_id, cache_params, problems_data)
+
+    def activate_prebuilt_cache(self, generation_id):
+        result = self._suffix_cache_manager.activate_prebuilt_cache(generation_id)
+        if result:
+            self._suffix_cache = self._suffix_cache_manager.get_current_cache()
+        return result
+
+    def __del__(self):
+        self._suffix_cache_manager.shutdown()
     
     def atomic_update_req_id_mapping(self, request_id: str, problem_id: str):
         """Update problem_id mapping via RPC from AsyncLLM."""

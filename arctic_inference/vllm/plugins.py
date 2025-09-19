@@ -77,6 +77,15 @@ class WorkerBasePatch(ArcticPatch[WorkerBase]):
     def set_suffix_cache(self, suffix_cache):
         """Wrapper method to set suffix cache on model runner."""
         return self.model_runner.set_suffix_cache(suffix_cache)
+
+    def rebuild_cache_sync(self, generation_id, cache_params, problems_data):
+        return self.model_runner.rebuild_cache_sync(generation_id, cache_params, problems_data)
+
+    def prebuild_cache_async(self, generation_id, cache_params, problems_data):
+        return self.model_runner.prebuild_cache_async(generation_id, cache_params, problems_data)
+
+    def activate_prebuilt_cache(self, generation_id):
+        return self.model_runner.activate_prebuilt_cache(generation_id)
     
     def set_hard_problems(self, hard_problems):
         """Wrapper method to set hard problems on model runner."""
