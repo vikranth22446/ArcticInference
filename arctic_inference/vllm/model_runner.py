@@ -1606,6 +1606,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 "total_accepted": total_accepted,
                 "accept_rate": total_accepted / total_proposed * 100 if total_proposed > 0 else 0,
                 "per_request_stats": per_request_stats,
+                "speculative_method": getattr(self.speculative_config, 'method', None) if hasattr(self, 'speculative_config') and self.speculative_config else None,
+                "suffix_decoding_enabled": getattr(self.speculative_config, 'enable_suffix_decoding', False) if hasattr(self, 'speculative_config') and self.speculative_config else False,
+                "suffix_cache_exists": self._suffix_cache is not None if hasattr(self, '_suffix_cache') else False,
                 "process_info": {
                     "rank": int(os.getenv("RANK", "0")),
                     "local_rank": int(os.getenv("LOCAL_RANK", "0")),
@@ -1654,6 +1657,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             "total_accepted": total_accepted,
             "accept_rate": total_accepted / total_proposed * 100 if total_proposed > 0 else 0,
             "per_request_stats": per_request_stats,
+            "speculative_method": getattr(self.speculative_config, 'method', None) if hasattr(self, 'speculative_config') and self.speculative_config else None,
+            "suffix_decoding_enabled": getattr(self.speculative_config, 'enable_suffix_decoding', False) if hasattr(self, 'speculative_config') and self.speculative_config else False,
+            "suffix_cache_exists": self._suffix_cache is not None if hasattr(self, '_suffix_cache') else False,
             "process_info": {
                 "rank": int(os.getenv("RANK", "0")),
                 "local_rank": int(os.getenv("LOCAL_RANK", "0")),
@@ -1664,7 +1670,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # Write to file
         self._write_suffix_tree_stats(stats_data)
         # Write token data to separate file
-        self._write_token_data_to_file(draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
+        # self._write_token_data_to_file(draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
     
     def _write_suffix_tree_stats(self, stats_data):
         """Write suffix tree decoding statistics to file with conflict avoidance"""
@@ -1694,7 +1700,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         """Write draft and valid token data to a separate file"""
         try:
             # Use environment variable for output directory
-            output_dir = os.getenv("ARCTIC_METRICS_DIR", "/app/src")
+            output_dir = os.getenv("ARCTIC_METRICS_DIR", "artic_metrics_data/")
             os.makedirs(output_dir, exist_ok=True)
             
             # Get process info for filename

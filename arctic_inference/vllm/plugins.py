@@ -82,7 +82,7 @@ class WorkerBasePatch(ArcticPatch[WorkerBase]):
         return self.model_runner.rebuild_cache_sync(generation_id, cache_params, problems_data)
 
     def prebuild_cache_async(self, generation_id, cache_params, problems_data):
-        return self.model_runner.prebuild_cache_async(generation_id, cache_params, problems_data)
+        self.model_runner.prebuild_cache_async(generation_id, cache_params, problems_data)
 
     def activate_prebuilt_cache(self, generation_id):
         return self.model_runner.activate_prebuilt_cache(generation_id)
