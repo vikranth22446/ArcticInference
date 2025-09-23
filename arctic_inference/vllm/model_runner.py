@@ -1369,6 +1369,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             if problem_id in self.acceptance_length_per_problem:
                 avg_acceptance_length = self.acceptance_length_per_problem[problem_id]["avg_acceptance_length"]
                 avg_acceptance_lengths.append(avg_acceptance_length)
+                problem_metrics[problem_id] = self.acceptance_length_per_problem[problem_id]
         avg_acceptance_length = np.mean(avg_acceptance_lengths) if avg_acceptance_lengths else 0.0
         return {
             'avg_acceptance_length': avg_acceptance_length,
