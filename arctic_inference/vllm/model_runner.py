@@ -885,7 +885,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # Mask out the sampled tokens that should not be sampled.
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
-        self._log_suffix_tree_stats(num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
+        # self._log_suffix_tree_stats(num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
