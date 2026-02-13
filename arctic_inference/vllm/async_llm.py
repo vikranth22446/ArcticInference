@@ -9,7 +9,7 @@ from vllm.lora.request import LoRARequest
 from vllm.prompt_adapter.request import PromptAdapterRequest
 from vllm.outputs import RequestOutput
 
-from arctic_inference.vllm.model_runner import ProblemIdContextManager
+from arctic_inference.vllm.context_managers import ProblemIdContextManager
 
 logger = init_logger(__name__)
 

@@ -5,7 +5,7 @@ import warnings
 from typing import Optional, Union, Sequence, Any, Callable
 from vllm.logger import init_logger
 
-from arctic_inference.vllm.model_runner import ProblemIdContextManager
+from arctic_inference.vllm.context_managers import ProblemIdContextManager
 
 logger = init_logger(__name__)
 

@@ -17,7 +17,7 @@ def test_imports():
     
     try:
         # 测试ArcticInference核心组件导入
-        from arctic_inference.vllm.model_runner import ProblemIdContextManager
+        from arctic_inference.vllm.context_managers import ProblemIdContextManager
         print("✓ ProblemIdContextManager导入成功")
         
         from arctic_inference.vllm.llm import apply_llm_patches, LLMPatch
@@ -80,7 +80,7 @@ def test_context_manager():
     print("\n=== 测试ProblemIdContextManager ===")
     
     try:
-        from arctic_inference.vllm.model_runner import ProblemIdContextManager
+        from arctic_inference.vllm.context_managers import ProblemIdContextManager
         
         # 测试req_id映射功能
         test_mapping = {"req_1": "problem_1", "req_2": "problem_2", "req_3": "problem_3"}
@@ -125,7 +125,7 @@ def test_integration():
     print("\n=== 集成测试 ===")
     
     try:
-        from arctic_inference.vllm.model_runner import ProblemIdContextManager
+        from arctic_inference.vllm.context_managers import ProblemIdContextManager
         from arctic_inference.vllm.llm import apply_llm_patches
         
         # 确保patches已应用
