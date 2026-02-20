@@ -12,7 +12,12 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-
+HARD_PROBLEMS = {
+    "prob_0056", "prob_0095", "prob_0077", "prob_0051", "prob_0067",
+    "prob_0061", "prob_0019", "prob_0002", "prob_0026", "prob_0055",
+    "prob_0074", "prob_0031", "prob_0012", "prob_0034", "prob_0010",
+    "prob_0024", "prob_0046", "prob_0081", "prob_0064", "prob_0090"
+}
 import contextlib
 import copy
 import time
@@ -357,7 +362,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         import atexit as _atexit
 
         # Buffer config via env with sensible defaults
-        self._timing_buffer: list[dict] = []
+        self.cpu_timing_buffer: list[dict] = []
+        self.gpu_timing_buffer: list[dict] = []
         self._timing_flush_every_n: int = int(_os.getenv("ARCTIC_TIMING_BUFFER_SIZE", "400"))
         self._timing_flush_every_s: float = float(_os.getenv("ARCTIC_TIMING_FLUSH_SEC", "5"))
         self._timing_last_flush_time: float = _time.monotonic()
@@ -367,10 +373,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         _os.makedirs(output_dir, exist_ok=True)
         local_rank = _os.getenv("LOCAL_RANK", "0")
         rank = _os.getenv("RANK", "0")
-        self._timing_file_path = _os.path.join(
-            output_dir, f"execution_timing_rank_{rank}_local_{local_rank}.jsonl"
+        self.cpu_timing_file_path = _os.path.join(
+            output_dir, f"execution_timing_rank_{rank}_local_{local_rank}_cpu.jsonl"
         )
-
+        self.gpu_timing_file_path = _os.path.join(
+            output_dir, f"execution_timing_rank_{rank}_local_{local_rank}_gpu.jsonl"
+        )
         # Ensure buffer flushes on process exit
         _atexit.register(lambda: self._flush_timing_buffer(force=True))
         
@@ -451,12 +459,17 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: Optional[IntermediateTensors] = None,
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
+    
 
         # Get process information for data parallel scenarios
         local_rank = os.getenv("LOCAL_RANK", "0")
         world_size = os.getenv("WORLD_SIZE", "1")
         rank = os.getenv("RANK", "0")
-        
+                    # ### Record GPU execution start time for monitoring
+        torch.cuda.synchronize()
+        execution_start_time = time.perf_counter()
+        execution_start_timestamp = datetime.now().isoformat()
+            
         self._update_states(scheduler_output)
         # Extract problem_ids for the current batch at the very beginning
         # Build req_id to problem_id mapping for the current batch
@@ -590,11 +603,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         ):
             self.maybe_setup_kv_connector(scheduler_output)
 
-            # ### Record GPU execution start time for monitoring
-            # torch.cuda.synchronize()
-            # execution_start_time = time.perf_counter()
-            # execution_start_timestamp = datetime.now().isoformat()
-            
             model = self.shift_model if use_shift_model else self.model
             with set_shift_parallel_mode(use_shift_model):
                 model_output = model(
@@ -754,7 +762,19 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # Mask out the sampled tokens that should not be sampled.
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
-        # self._log_suffix_tree_stats(num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
+
+                        # #### Record GPU execution end time after all GPU computations are complete
+        torch.cuda.synchronize()
+        execution_end_time = time.perf_counter()
+        execution_duration = execution_end_time - execution_start_time
+        self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
+                                scheduler_output.total_num_scheduled_tokens, early_return=False,type="gpu")
+
+        self._log_suffix_tree_stats(num_draft_tokens, draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
+
+        torch.cuda.synchronize()
+        execution_start_time = time.perf_counter()
+        execution_start_timestamp = datetime.now().isoformat()
 
         # Cache the sampled tokens in the model runner, so that the scheduler
         # doesn't need to send them back.
@@ -803,34 +823,41 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 spec_decode_metadata,
                 attn_metadata,
             )
-            # Get dynamic configuration or use defaults
-            dynamic_hard_problems = ProblemIdContextManager.get_dynamic_hard_problems()
-            dynamic_max_quota = ProblemIdContextManager.get_dynamic_max_quota()
+            # # Get dynamic configuration or use defaults
+            # dynamic_hard_problems = ProblemIdContextManager.get_dynamic_hard_problems()
+            # dynamic_max_quota = ProblemIdContextManager.get_dynamic_max_quota()
             
-            current_hard_problems = dynamic_hard_problems if dynamic_hard_problems is not None else HARD_PROBLEMS
-            MAX_SPEC_QUOTA = dynamic_max_quota if dynamic_max_quota is not None else 160
+            # # When no dynamic config is set yet (e.g. before first update_hard_problems), use empty set
+            # current_hard_problems = dynamic_hard_problems if dynamic_hard_problems is not None else set()
+            # MAX_SPEC_QUOTA = dynamic_max_quota if dynamic_max_quota is not None else 160
             
-            if spec_token_ids is not None:
-                hard_indices, non_hard_indices = classify_request_indices(
-                    self.input_batch.req_ids,
-                    self._current_batch_req_id_to_problem_id,
-                    current_hard_problems,
-                )
-                hard_spec_tokens = sum_tokens_at_indices(spec_token_ids, hard_indices)
-                if hard_spec_tokens > MAX_SPEC_QUOTA:
-                    keep_ratio = MAX_SPEC_QUOTA / hard_spec_tokens
-                    spec_token_ids = apply_hard_overflow_strategy(
-                        spec_token_ids, hard_indices, keep_ratio
-                    )
-                else:
-                    remaining_quota = MAX_SPEC_QUOTA - hard_spec_tokens
-                    spec_token_ids = apply_non_hard_allocation_strategy(
-                        spec_token_ids, hard_indices, remaining_quota
-                    )
+            # if spec_token_ids is not None:
+            #     hard_indices, non_hard_indices = classify_request_indices(
+            #         self.input_batch.req_ids,
+            #         self._current_batch_req_id_to_problem_id,
+            #         current_hard_problems,
+            #     )
+            #     hard_spec_tokens = sum_tokens_at_indices(spec_token_ids, hard_indices)
+            #     if hard_spec_tokens > MAX_SPEC_QUOTA:
+            #         keep_ratio = MAX_SPEC_QUOTA / hard_spec_tokens
+            #         spec_token_ids = apply_hard_overflow_strategy(
+            #             spec_token_ids, hard_indices, keep_ratio
+            #         )
+            #     else:
+            #         remaining_quota = MAX_SPEC_QUOTA - hard_spec_tokens
+            #         spec_token_ids = apply_non_hard_allocation_strategy(
+            #             spec_token_ids, hard_indices, remaining_quota
+            #         )
 
         # Clear KVConnector state after all KVs are generated.
         if has_kv_transfer_group():
             get_kv_transfer_group().clear_connector_metadata()
+
+        torch.cuda.synchronize()
+        execution_end_time = time.perf_counter()
+        execution_duration = execution_end_time - execution_start_time
+        self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
+                                scheduler_output.total_num_scheduled_tokens, early_return=False,type="cpu")
 
         # # self.eplb_step()
         return ModelRunnerOutput(
@@ -1382,7 +1409,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
 
 # -- Debug and metrics logging utilities --
 
-    def _log_execution_time(self, start_timestamp, duration_seconds, batch_size, num_scheduled_tokens,early_return=False):
+    def _log_execution_time(self, start_timestamp, duration_seconds, batch_size, num_scheduled_tokens,early_return=False,type="cpu"):
         """Log execution time metrics for execute_model calls"""
         try:
             timing_data = {
@@ -1397,25 +1424,27 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     "local_rank": int(os.getenv("LOCAL_RANK", "0")),
                     "world_size": int(os.getenv("WORLD_SIZE", "1"))
                 },
-                "early_return": early_return
+                "early_return": early_return,
             }
             
             # Write to file
-            self._write_timing_stats(timing_data)
+            self._write_timing_stats(timing_data,type=type)
             
         except Exception as e:
             # Log error but don't crash the model
             logger.error(f"Failed to log execution time: {e}")
     
-    def _write_timing_stats(self, timing_data):
+    def _write_timing_stats(self, timing_data,type="cpu"):
         """Buffer execution timing data and flush periodically to reduce I/O."""
         try:
             # Enqueue timing data
-            self._timing_buffer.append(json.dumps(timing_data, default=self._json_serializable))
+            if type == "cpu":
+                self.cpu_timing_buffer.append(json.dumps(timing_data, default=self._json_serializable))
+            elif type == "gpu":
+                self.gpu_timing_buffer.append(json.dumps(timing_data, default=self._json_serializable))
 
             # Flush conditions: buffer size or time threshold
-            should_flush_by_n = len(self._timing_buffer) >= self._timing_flush_every_n
-            if should_flush_by_n:
+            if len(self.cpu_timing_buffer) >= self._timing_flush_every_n:
                 self._flush_timing_buffer()
         except Exception as e:
             logger.error(f"Failed to buffer timing stats: {e}")
@@ -1426,18 +1455,20 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         When force is True, flush unconditionally (e.g., at exit).
         """
         try:
-            if not self._timing_buffer and not force:
+            if not self.cpu_timing_buffer and not force:
                 return
             # Nothing to write if empty and not forced
-            if not self._timing_buffer:
-                self._timing_last_flush_time = time.monotonic()
+            if not self.cpu_timing_buffer:
+                self.timing_last_flush_time = time.monotonic()
                 return
 
             # Write all pending lines at once
-            with open(self._timing_file_path, "a") as f:
-                f.write("\n".join(self._timing_buffer) + "\n")
-            self._timing_buffer.clear()
-            self._timing_last_flush_time = time.monotonic()
+            with open(self.cpu_timing_file_path, "a") as f:
+                f.write("\n".join(self.cpu_timing_buffer) + "\n")
+            with open(self.gpu_timing_file_path, "a") as f:
+                f.write("\n".join(self.gpu_timing_buffer) + "\n")
+            self.cpu_timing_buffer.clear()
+            self.timing_last_flush_time = time.monotonic()
         except Exception as e:
             logger.error(f"Failed to flush timing stats: {e}")
 

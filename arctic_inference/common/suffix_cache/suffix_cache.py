@@ -271,12 +271,19 @@ class SuffixCache:
         
         tree = self._problem_tree[problem_id]
         
+        # Guard against None: extend_safe/extend require Sequence[int], not None
+        prompt_tokens = prompt_token_ids if prompt_token_ids is not None else []
+        tokens = token_ids if token_ids is not None else []
         if self._thread_safe:
-            tree.extend_safe(seq_id, prompt_token_ids)
-            tree.extend_safe(seq_id, token_ids)
+            if prompt_tokens:
+                tree.extend_safe(seq_id, prompt_tokens)
+            if tokens:
+                tree.extend_safe(seq_id, tokens)
         else:
-            tree.extend(seq_id, prompt_token_ids)
-            tree.extend(seq_id, token_ids) 
+            if prompt_tokens:
+                tree.extend(seq_id, prompt_tokens)
+            if tokens:
+                tree.extend(seq_id, tokens) 
 
     def speculate(
         self,
