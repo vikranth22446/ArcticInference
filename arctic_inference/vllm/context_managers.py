@@ -9,7 +9,7 @@
 
 import contextlib
 import threading
-from typing import Optional
+from typing import List, Optional
 
 # Thread-local storage for problem_ids context and global lock for atomic operations
 _problem_id_context = threading.local()
@@ -78,6 +78,64 @@ class ProblemIdContextManager:
         """Clear only the req_id mapping, keep problem_ids."""
         if hasattr(_problem_id_context, 'data'):
             _problem_id_context.data.pop('req_id_to_problem_id', None)
+
+    @staticmethod
+    def set_hard_medium_ids(
+        hard_ids: Optional[List[str]] = None,
+        medium_ids: Optional[List[str]] = None,
+        easy_ids: Optional[List[str]] = None,
+    ):
+        """Set hard, medium, and easy problem IDs for distribution-aware processing."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        _problem_id_context.data['hard_ids'] = hard_ids or []
+        _problem_id_context.data['medium_ids'] = medium_ids or []
+        _problem_id_context.data['easy_ids'] = easy_ids or []
+
+    @staticmethod
+    def get_hard_medium_ids() -> tuple[Optional[List[str]], Optional[List[str]], Optional[List[str]]]:
+        """Get hard, medium, and easy problem IDs."""
+        if not hasattr(_problem_id_context, 'data'):
+            return None, None, None
+        return (
+            _problem_id_context.data.get('hard_ids'),
+            _problem_id_context.data.get('medium_ids'),
+            _problem_id_context.data.get('easy_ids'),
+        )
+
+    @staticmethod
+    def set_hard_medium_indices(
+        hard_indices: List[int],
+        medium_indices: List[int],
+        easy_indices: List[int],
+        allowed_indices: List[int],
+    ):
+        """Cache hard, medium, and easy indices for the current batch."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        _problem_id_context.data['hard_indices'] = hard_indices
+        _problem_id_context.data['medium_indices'] = medium_indices
+        _problem_id_context.data['easy_indices'] = easy_indices
+        _problem_id_context.data['allowed_indices'] = allowed_indices
+
+    @staticmethod
+    def get_hard_medium_indices() -> tuple[List[int], List[int], List[int], List[int]]:
+        """Get cached hard, medium, and easy indices."""
+        if not hasattr(_problem_id_context, 'data'):
+            return [], [], [], []
+        return (
+            _problem_id_context.data.get('hard_indices', []),
+            _problem_id_context.data.get('medium_indices', []),
+            _problem_id_context.data.get('easy_indices', []),
+            _problem_id_context.data.get('allowed_indices', []),
+        )
+
+    @staticmethod
+    def has_hard_medium_indices() -> bool:
+        """Check if hard/medium indices are cached."""
+        if not hasattr(_problem_id_context, 'data'):
+            return False
+        return 'hard_indices' in _problem_id_context.data
 
     @staticmethod
     def set_dynamic_config(hard_problems=None, max_quota=None):

@@ -823,11 +823,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 spec_decode_metadata,
                 attn_metadata,
             )
-            # # Get dynamic configuration or use defaults
+            # Get dynamic configuration or use defaults
             # dynamic_hard_problems = ProblemIdContextManager.get_dynamic_hard_problems()
             # dynamic_max_quota = ProblemIdContextManager.get_dynamic_max_quota()
             
-            # # When no dynamic config is set yet (e.g. before first update_hard_problems), use empty set
+            # When no dynamic config is set yet (e.g. before first update_hard_problems), use empty set
             # current_hard_problems = dynamic_hard_problems if dynamic_hard_problems is not None else set()
             # MAX_SPEC_QUOTA = dynamic_max_quota if dynamic_max_quota is not None else 160
             
@@ -965,6 +965,48 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 return problem_id
         print(f"Failed to get problem_id for request {req_id}")
         return None
+
+    def _get_hard_and_non_hard_indices(
+        self, top_percent: float = 0.3
+    ) -> tuple[list[int], list[int], list[int], list[int]]:
+        """
+        计算当前 batch 中的 hard 和 medium 请求索引。
+
+        基于 ProblemIdContextManager.get_hard_medium_ids() 提供的 problem_id 列表，
+        将属于 hard_ids 的请求划为 hard，将属于 medium_ids 的请求划为 non-hard（此处表示 medium）。
+        其他未列入者不分配配额。
+        """
+        if ProblemIdContextManager.has_hard_medium_indices():
+            cached_hard, cached_medium, cached_easy, cached_allowed_indices = (
+                ProblemIdContextManager.get_hard_medium_indices()
+            )
+            return cached_hard, cached_medium, cached_easy, cached_allowed_indices
+        else:
+            hard_indices: list[int] = []
+            medium_indices: list[int] = []
+            easy_indices: list[int] = []
+            hard_ids, medium_ids, easy_ids = ProblemIdContextManager.get_hard_medium_ids()
+            hard_set = set(str(pid) for pid in (hard_ids or []))
+            medium_set = set(str(pid) for pid in (medium_ids or []))
+            easy_set = set(str(pid) for pid in (easy_ids or []))
+            for i, req_id in enumerate(self.input_batch.req_ids):
+                problem_id = ProblemIdContextManager.get_problem_id_for_req_id(req_id)
+                if problem_id is None:
+                    problem_id = self.get_problem_id_by_request_id(req_id)
+                pid_str = str(problem_id) if problem_id else ""
+                if pid_str in hard_set:
+                    hard_indices.append(i)
+                elif pid_str in medium_set:
+                    medium_indices.append(i)
+                elif pid_str in easy_set:
+                    easy_indices.append(i)
+
+            allowed_indices = hard_indices + medium_indices + easy_indices
+            ProblemIdContextManager.set_hard_medium_indices(
+                hard_indices, medium_indices, easy_indices, allowed_indices
+            )
+
+        return hard_indices, medium_indices, easy_indices, allowed_indices
 
     def propose_draft_token_ids(
         self,
@@ -1111,10 +1153,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 prompt_token_ids = (
                     self.input_batch.token_ids_cpu[index, :num_prompt_tokens])
                 print(f"DEBUG: Caching prompt for req_id={req_id}, prompt_tokens={num_prompt_tokens}")
-                self._suffix_cache.cache_prompt(req_id, prompt_token_ids)
+                self._suffix_cache.cache_prompt(req_id, prompt_token_ids, problem_id=problem_id)
 
             #print(f"DEBUG: Updating response for req_id={req_id} with {len(sampled_ids)} tokens")
-            self._suffix_cache.update_response(req_id, problem_id,sampled_ids)
+            self._suffix_cache.update_response(req_id, problem_id, sampled_ids)
 
 
     def propose_suffix_draft_token_ids(
@@ -1123,8 +1165,20 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         spec_token_ids: Optional[list[list[int]]] = None,
     ) -> list[list[int]]:
         config = self.speculative_config
+
+        # Get hard/medium/easy indices
+        hard_indices, medium_indices, easy_indices, allowed_indices = (
+            self._get_hard_and_non_hard_indices()
+        )
+
+        # Define spec parameters based on problem difficulty and batch size
+        hard_spec, hard_prob, hard_spec_factor = 16, 0.1, 2
+        medium_spec, medium_prob, medium_spec_factor = 8, 0.1, 1
+        current_spec_tokens = medium_spec  # default
+        current_min_prob = config.suffix_min_token_prob  # default
+        current_spec_factor = config.suffix_max_spec_factor  # default
+
         results = []
-        
         for i, sampled_ids in enumerate(sampled_token_ids):
             spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
             num_sampled_ids = len(sampled_ids)
@@ -1134,32 +1188,51 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 continue
 
             req_id = self.input_batch.req_ids[i]
-            problem_id = self.get_problem_id_by_request_id(req_id)  # Method 1: Direct lookup
-            if problem_id is None:
-                print(f"problem_id is None for req_id={req_id}")
+            problem_id = self.get_problem_id_by_request_id(req_id)
 
-            # Add sampled_token_ids to token_ids_cpu.
             end_idx = self.input_batch.num_tokens_no_spec[i]
-            # end_idx = start_idx + len(sampled_ids)
+            size = min(end_idx, config.suffix_cache_max_depth)
+            pattern = self.input_batch.token_ids_cpu[i, end_idx - size : end_idx]
+
+            pattern = pattern.tolist() + spec_ids
+            if len(pattern) > config.suffix_cache_max_depth:
+                pattern = pattern[-config.suffix_cache_max_depth :]
 
             if end_idx >= self.max_model_len:
                 results.append(SuffixSpecResult())
-                # self.input_batch.token_ids_cpu[
-                #     i, start_idx:self.
-                #     max_model_len] = sampled_ids[:self.max_model_len -
-                #                                  start_idx]
                 continue
 
-            # self.input_batch.token_ids_cpu[i, start_idx:end_idx] = sampled_ids
+            if i in hard_indices:
+                current_spec_tokens = hard_spec
+                current_min_prob = hard_prob
+                current_spec_factor = hard_spec_factor
+            elif i in medium_indices:
+                current_spec_tokens = medium_spec
+                current_min_prob = medium_prob
+                current_spec_factor = medium_spec_factor
+            elif end_idx < 4000:
+                results.append(SuffixSpecResult())
+                continue
+            if end_idx > 4000 and end_idx < 8000 and i in easy_indices:
+                current_spec_tokens, current_min_prob, current_spec_factor = (
+                    medium_spec,
+                    medium_prob,
+                    medium_spec_factor,
+                )
+            if end_idx > 8000 and i not in hard_indices:
+                current_spec_tokens, current_min_prob, current_spec_factor = (
+                    hard_spec,
+                    hard_prob,
+                    hard_spec_factor,
+                )
 
-            size = min(end_idx, config.suffix_cache_max_depth)
-            pattern = self.input_batch.token_ids_cpu[i, end_idx - size:end_idx]
-            pattern = pattern.tolist() + spec_ids
-            if len(pattern) > config.suffix_cache_max_depth:
-                pattern = pattern[-config.suffix_cache_max_depth:]
-            max_spec_tokens = min(MAX_SPEC_LEN - len(spec_ids),
-                                  config.suffix_cache_max_depth,
-                                  self.max_model_len - end_idx - 1)
+            max_spec_tokens = min(
+                MAX_SPEC_LEN - len(spec_ids),
+                config.suffix_cache_max_depth,
+                self.max_model_len - end_idx - 1,
+                current_spec_tokens,
+            )
+
             # max_spec_offset is modified to mimic the behavior of the original
             # max_spec_factor and max_spec_offset as if the speculative tokens
             # were generated by suffix decoding. For example, if:
@@ -1172,9 +1245,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             #   - The original config allow up to 5 speculated tokens total
             #   - Already speculated 3 tokens, so should allow 2 more tokens
             # So the new config should map match length 6 to 2 max spec tokens.
-            max_spec_factor = config.suffix_max_spec_factor
-            max_spec_offset = (config.suffix_max_spec_offset - len(spec_ids) *
-                               (max_spec_factor + 1))
+            max_spec_factor = current_spec_factor
+            max_spec_offset = config.suffix_max_spec_offset - len(spec_ids) * (
+                max_spec_factor + 1
+            )
+
             result = self._suffix_cache.speculate(
                 req_id,
                 problem_id,
@@ -1182,7 +1257,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 max_spec_tokens=max_spec_tokens,
                 max_spec_factor=max_spec_factor,
                 max_spec_offset=max_spec_offset,
-                min_token_prob=config.suffix_min_token_prob)
+                min_token_prob=current_min_prob,
+            )
 
             results.append(result)
 
@@ -1468,6 +1544,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             with open(self.gpu_timing_file_path, "a") as f:
                 f.write("\n".join(self.gpu_timing_buffer) + "\n")
             self.cpu_timing_buffer.clear()
+            self.gpu_timing_buffer.clear()
             self.timing_last_flush_time = time.monotonic()
         except Exception as e:
             logger.error(f"Failed to flush timing stats: {e}")

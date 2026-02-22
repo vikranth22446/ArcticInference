@@ -98,7 +98,12 @@ class SuffixCache:
     def cached_prompt_ids(self) -> List[Hashable]:
         return list(self._prompt_trees.keys())
 
-    def cache_prompt(self, req_id: Hashable, prompt_token_ids: Sequence[int]):
+    def cache_prompt(
+        self,
+        req_id: Hashable,
+        prompt_token_ids: Sequence[int],
+        problem_id: Optional[Hashable] = None,
+    ):
         """
         Cache a prompt for a specific request ID. Future speculations for the
         same request may also source draft tokens from this prompt.
@@ -108,6 +113,8 @@ class SuffixCache:
                 that uniquely identifies the request.
             prompt_token_ids (Sequence[int]): A sequence of token IDs
                 representing the prompt to be cached.
+            problem_id (Hashable, optional): Unused in SuffixCache; kept for API
+                compatibility with SuffixCacheAdapter.
 
         Raises:
             ValueError: If a prompt already exists for the given request ID.
