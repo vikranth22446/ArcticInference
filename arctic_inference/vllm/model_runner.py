@@ -210,7 +210,7 @@ def extract_problem_id_from_prompt(prompt) -> Optional[str]:
 
 
 class SuffixCacheWorkerManager:
-    def __init__(self, max_workers=2):
+    def __init__(self, max_workers=8):
         self._current_cache = None
         self._current_generation_id = -1
         self._prebuilt_caches = {}
@@ -225,7 +225,7 @@ class SuffixCacheWorkerManager:
     def get_current_generation_id(self):
         with self._lock:
             return self._current_generation_id
-    
+            
     def rebuild_cache_sync(self, generation_id, cache_params, problems_data):
         if generation_id <= self._current_generation_id:
             return False
@@ -242,7 +242,7 @@ class SuffixCacheWorkerManager:
             if old_cache:
                 self._executor.submit(old_cache.clear_all_cache)
         return True
-    
+
     def prebuild_cache_async(self, generation_id, cache_params, problems_data):
         if generation_id in self._build_futures:
             old_future = self._build_futures.pop(generation_id)
@@ -340,7 +340,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self.acceptance_length_per_problem = {}
         # Set up speculative decoding.
         self._suffix_cache = None
-        self._suffix_cache_manager = SuffixCacheWorkerManager(max_workers=2)
+        self._suffix_cache_manager = SuffixCacheWorkerManager(max_workers=8)
         if arctic_speculative_config is not None:
             # Restore the speculative config.
             self.vllm_config.speculative_config = arctic_speculative_config
@@ -1152,7 +1152,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 num_prompt_tokens = self.input_batch.num_prompt_tokens[index]
                 prompt_token_ids = (
                     self.input_batch.token_ids_cpu[index, :num_prompt_tokens])
-                print(f"DEBUG: Caching prompt for req_id={req_id}, prompt_tokens={num_prompt_tokens}")
                 self._suffix_cache.cache_prompt(req_id, prompt_token_ids, problem_id=problem_id)
 
             #print(f"DEBUG: Updating response for req_id={req_id} with {len(sampled_ids)} tokens")

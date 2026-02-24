@@ -17,12 +17,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Hashable, KeysView, List, Optional, Sequence, Union, Tuple
+import gc
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import gc
 
 from arctic_inference.suffix_decoding._C import SuffixTree, Candidate
+
+# Set SUFFIX_CACHE_PROFILE=1 to enable detailed bottleneck analysis for prebuild and cleanup
+_PROFILE_ENABLED = os.environ.get("SUFFIX_CACHE_PROFILE", "0") in ("1", "true", "yes")
 
 
 @dataclass
@@ -427,12 +431,23 @@ class SuffixDecodingCache:
                 """Clear a group of trees in one thread"""
                 thread_start = time.perf_counter()
                 cleared_count = 0
+                tree_timings = []  # (problem_id, time_s, num_seqs)
                 for problem_id, tree in group_data:
+                    num_seqs = -1
+                    if _PROFILE_ENABLED:
+                        try:
+                            num_seqs = tree.num_seqs_safe() if hasattr(tree, "num_seqs_safe") else tree.num_seqs()
+                        except Exception:
+                            pass
+                        t0 = time.perf_counter()
                     tree.clear()
                     cleared_count += 1
+                    if _PROFILE_ENABLED:
+                        tree_timings.append((problem_id, time.perf_counter() - t0, num_seqs))
                 return {
                     "cleared": cleared_count,
                     "time": time.perf_counter() - thread_start,
+                    "tree_timings": tree_timings if _PROFILE_ENABLED else [],
                 }
 
             num_workers = len([g for g in thread_groups if g])
@@ -451,6 +466,11 @@ class SuffixDecodingCache:
                 f"using {len(results)} threads"
             )
 
+            # Profiling: bottleneck analysis for cleanup (enable with SUFFIX_CACHE_PROFILE=1)
+            if _PROFILE_ENABLED and results:
+                print("\n🔍 [CLEANUP] Detailed bottleneck analysis (SUFFIX_CACHE_PROFILE=1):")
+                self._print_cleanup_profile(results, thread_groups)
+
             if clear_full_cache:
                 self._problem_tree.clear()
                 self._local_trees.clear()
@@ -458,12 +478,18 @@ class SuffixDecodingCache:
                 for problem_id, _ in trees_to_clear:
                     self._problem_tree.pop(problem_id, None)
 
+        gc_start = time.perf_counter()
         gc.collect()
+        gc_elapsed = time.perf_counter() - gc_start
         elapsed = time.time() - start_time
+        if _PROFILE_ENABLED and gc_elapsed > 1.0:
+            print(f"📊 [CLEANUP PROFILE] gc.collect() took {gc_elapsed:.2f}s")
         print(
             f"✅ Parallel cleanup completed in {elapsed:.3f}s - {num_to_clear} problem trees cleared"
             + (f", {num_local_trees} local trees" if clear_full_cache else "")
         )
+        if elapsed > 60 and not _PROFILE_ENABLED:
+            print("  💡 Tip: Set SUFFIX_CACHE_PROFILE=1 for detailed bottleneck analysis")
         return {"success": True, "elapsed": elapsed, "cleared_count": num_to_clear}
 
     def get_cache_stats(self) -> dict:
@@ -492,3 +518,31 @@ class SuffixDecodingCache:
             stats["total_sequences_in_problem_trees"] = total_seqs
         
         return stats
+
+    def _print_cleanup_profile(self, results: list, thread_groups: list) -> None:
+        """Print detailed bottleneck analysis for cleanup when SUFFIX_CACHE_PROFILE=1."""
+        # 1. Thread load imbalance
+        thread_counts = [len(g) for g in thread_groups if g]
+        thread_times = [r["time"] for r in results]
+        print("\n📊 [CLEANUP PROFILE] Thread load analysis:")
+        for i, (count, t) in enumerate(zip(thread_counts, thread_times)):
+            pct = 100 * count / sum(thread_counts) if thread_counts else 0
+            print(f"  Thread {i}: {count} trees ({pct:.1f}%), {t:.2f}s")
+        if thread_times:
+            avg_t = sum(thread_times) / len(thread_times)
+            imbalance = max(thread_times) / avg_t if avg_t > 0 else 1.0
+            print(f"  Load imbalance ratio (max/avg): {imbalance:.2f}x")
+
+        # 2. Per-tree timing: top slowest
+        all_timings = []
+        for r in results:
+            all_timings.extend(r.get("tree_timings", []))
+        if all_timings:
+            all_timings.sort(key=lambda x: x[1], reverse=True)
+            print("\n📊 [CLEANUP PROFILE] Top 10 slowest trees to clear:")
+            for i, (pid, t, num_seqs) in enumerate(all_timings[:10]):
+                seq_info = f", {num_seqs} seqs" if num_seqs >= 0 else ""
+                print(f"  #{i+1} problem_id={pid}: {t:.3f}s{seq_info}")
+            avg_t = sum(x[1] for x in all_timings) / len(all_timings)
+            print(f"\n  Avg per tree: {avg_t:.3f}s")
+            print("  Bottleneck hint: tree.clear() holds C++ mutex during deallocation; large trees serialize")

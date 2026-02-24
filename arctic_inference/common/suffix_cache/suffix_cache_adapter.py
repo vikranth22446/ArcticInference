@@ -1,21 +1,13 @@
 """适配器：用 SuffixDecodingCache 实现 SuffixCache 的 API，以使用 rllm 的高效 C++ 实现"""
-import hashlib
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Hashable, List, Optional, Sequence, Tuple, Union
-
+import time
 from arctic_inference.suffix_decoding import SuffixDecodingCache, SuffixDecodingDraft
 from arctic_inference.suffix_decoding._C import SuffixTree
 
 # Do NOT import from .suffix_cache - it loads suffix_cache._C which conflicts with
 # suffix_decoding._C (both register "Candidate" in pybind11). Use SuffixDecodingDraft
 # as the result type; __init__.py aliases it as SuffixSpecResult when adapter is enabled.
-
-try:
-    from tqdm import tqdm
-except ImportError:
-    def tqdm(iterable, **kwargs):
-        return iterable
 
 
 class SuffixCacheAdapter(SuffixDecodingCache):
@@ -70,133 +62,142 @@ class SuffixCacheAdapter(SuffixDecodingCache):
         """Clear all cached data. Compatible with SuffixCache interface."""
         self.clear_cache(problem_ids=None)
 
-    def _prebuild_problemtree(
+    def _normalize_prebuild_input(
         self,
-        seq_id: int,
-        problem_id: Hashable,
-        prompt_token_ids: List[int],
-        token_ids: List[int],
-    ):
-        """Build a single problem tree entry. Uses rllm's SuffixTree (C++ backend)."""
-        if problem_id not in self._problem_tree:
-            self._problem_tree[problem_id] = SuffixTree(self._max_tree_depth)
-        tree = self._problem_tree[problem_id]
-        tokens = token_ids if token_ids is not None else []
-        tree.extend(seq_id, tokens)
+        data: List[Union[dict, Tuple[Hashable, List[int], List[List[int]]]]],
+    ) -> List[dict]:
+        """
+        Normalize input to the canonical format. Accepts both:
+        - New format: [{'problem_id': pid, 'sequences': [{'seq_id', 'prompt_tokens', 'response_tokens'}, ...]}, ...]
+        - Old format: [(problem_id, prompt_tokens, sequences), ...] where sequences is List[List[int]]
+        """
+        if not data:
+            return []
+        first = data[0]
+        if isinstance(first, dict) and "problem_id" in first:
+            return list(data)
+        # Old format: (problem_id, prompt_tokens, sequences)
+        normalized = []
+        for problem_id, prompt_tokens, sequences in data:
+            normalized.append({
+                "problem_id": problem_id,
+                "sequences": [
+                    {
+                        "seq_id": -i - 1,
+                        "prompt_tokens": list(prompt_tokens) if prompt_tokens else [],
+                        "response_tokens": list(token_ids) if token_ids else [],
+                    }
+                    for i, token_ids in enumerate(sequences)
+                ],
+            })
+        return normalized
 
     def prebuild_problems_parallel(
         self,
-        problems_data: List[Tuple[Hashable, List[int], List[List[int]]]],
+        problem_data: List[Union[dict, Tuple[Hashable, List[int], List[List[int]]]]],
     ) -> dict:
         """
-        Build multiple problem trees in parallel. Uses vsrivatsa's logic
-        (hash-based load balancing, serial fallback) with rllm's C++ SuffixTree.
+        Pre-build multiple problem trees in parallel using ThreadPoolExecutor.
+        Logic matches arctic_inference/suffix_decoding/cache.py.
 
         Args:
-            problems_data: List of (problem_id, prompt_tokens, sequences)
-                in vsrivatsa format.
+            problem_data: Either format:
+                - New: [{'problem_id': pid, 'sequences': [{'seq_id', 'prompt_tokens', 'response_tokens'}, ...]}, ...]
+                - Old: [(problem_id, prompt_tokens, sequences), ...] where sequences is List[List[int]]
 
         Returns:
-            Dictionary with performance statistics.
+            dict: Results containing success status and statistics
         """
-        if not self._thread_safe:
-            return self._build_problems_serial(problems_data)
+        start_time = time.time()
+        if not problem_data:
+            end_time = time.time()
+            print(f"Time taken to prebuild problems: {end_time - start_time} seconds")
+            return {"success": True, "problems_built": 0, "total_problems": 0}
 
-        if not problems_data:
-            return {"total_problems": 0, "total_time": 0.0, "method": "no_data"}
+        problem_data = self._normalize_prebuild_input(problem_data)
 
-        start_time = time.perf_counter()
-
-        # Hash-based load balancing (vsrivatsa style)
+        # Validate and normalize input data with assertions
+        # Thread grouping and load balancing (round-robin per problem)
         thread_groups = [[] for _ in range(self._max_threads)]
-        for problem_id, prompt_tokens, sequences in problems_data:
-            problem_hash = hashlib.md5(str(problem_id).encode()).hexdigest()
-            thread_id = int(problem_hash, 16) % self._max_threads
-            thread_groups[thread_id].append((problem_id, prompt_tokens, sequences))
 
-        def process_thread_group(group_data):
-            processed = 0
-            operations = 0
-            thread_start = time.perf_counter()
-            for problem_id, prompt_tokens, sequences in group_data:
-                for i, token_ids in enumerate(sequences):
-                    seq_id = -i - 1
-                    self._prebuild_problemtree(seq_id, problem_id, prompt_tokens, token_ids)
-                    operations += 2
-                processed += 1
-            return {
-                "processed": processed,
-                "operations": operations,
-                "time": time.perf_counter() - thread_start,
-            }
+        for i, item in enumerate(problem_data):
+            assert isinstance(item, dict), f"Expected dict at index {i}, got {type(item)}"
+            assert "problem_id" in item, f"Missing 'problem_id' key at index {i}"
 
-        workers = [g for g in thread_groups if g]
-        with ThreadPoolExecutor(max_workers=len(workers)) as executor:
-            futures = [
-                executor.submit(process_thread_group, group)
-                for group in thread_groups
-                if group
-            ]
+            problem_id = item["problem_id"]
+            sequences = item.get("sequences", [])
+            assert isinstance(sequences, list), (
+                f"'sequences' must be list at index {i}, got {type(sequences)}"
+            )
+
+            thread_idx = i % self._max_threads
+
+            for seq_idx, seq_data in enumerate(sequences):
+                assert isinstance(seq_data, dict), (
+                    f"Sequence at index {i}.{seq_idx} must be dict, got {type(seq_data)}"
+                )
+
+                seq_id = seq_data.get("seq_id", seq_idx)
+                prompt_tokens = seq_data.get("prompt_tokens", [])
+                response_tokens = seq_data.get("response_tokens", [])
+
+                assert isinstance(seq_id, int), (
+                    f"seq_id must be int at {i}.{seq_idx}, got {type(seq_id)}"
+                )
+                assert isinstance(prompt_tokens, list), (
+                    f"prompt_tokens must be list at {i}.{seq_idx}, got {type(prompt_tokens)}"
+                )
+                assert isinstance(response_tokens, list), (
+                    f"response_tokens must be list at {i}.{seq_idx}, got {type(response_tokens)}"
+                )
+
+                thread_groups[thread_idx].append(
+                    (seq_id, problem_id, prompt_tokens, response_tokens)
+                )
+
+        def prebuild_problem_group(group_data):
+            """Pre-build a group of problems in one thread"""
+            built_count = 0
+
+            for seq_id, problem_id, prompt_tokens, response_tokens in group_data:
+                try:
+                    if problem_id not in self._problem_tree:
+                        self._problem_tree[problem_id] = SuffixTree(self._max_tree_depth)
+
+                    tree = self._problem_tree[problem_id]
+
+                    if prompt_tokens or response_tokens:
+                        if self._thread_safe:
+                            tree.extend_safe(seq_id, prompt_tokens + response_tokens)
+                        else:
+                            tree.extend(seq_id, prompt_tokens + response_tokens)
+
+                    built_count += 1
+
+                except Exception as e:
+                    print(f"Error building problem {problem_id}: {e}")
+                    continue
+
+            return {"built": built_count}
+
+        max_workers = len([g for g in thread_groups if g])
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = []
+            for group in thread_groups:
+                if group:
+                    future = executor.submit(prebuild_problem_group, group)
+                    futures.append(future)
+
             results = []
-            for future in tqdm(as_completed(futures), total=len(futures),
-                              desc="Building with C++ object-level locking"):
+            for future in as_completed(futures):
                 results.append(future.result())
 
-        total_time = time.perf_counter() - start_time
-        total_processed = sum(r["processed"] for r in results)
-        total_operations = sum(r["operations"] for r in results)
-        thread_times = [r["time"] for r in results]
-        parallel_time = max(thread_times) if thread_times else 0.0
-        sequential_equivalent_time = sum(thread_times)
-        theoretical_speedup = sequential_equivalent_time / parallel_time if parallel_time > 0 else 1.0
-        actual_speedup = sequential_equivalent_time / total_time if total_time > 0 else 1.0
+        total_built = sum(r["built"] for r in results)
 
-        print("🚀 C++ Object-Level Locking Results (rllm backend):")
-        print(f"  Total time: {total_time:.4f}秒")
-        print(f"  Parallel time: {parallel_time:.4f}秒")
-        print(f"  Processed problems: {total_processed}")
-        print(f"  Total operations: {total_operations}")
-        print(f"  Theoretical speedup: {theoretical_speedup:.2f}x")
-        print(f"  Actual speedup: {actual_speedup:.2f}x")
-        print(f"  Active threads: {len(results)}")
-
+        end_time = time.time()
+        print(f"[SUFFIX_CACHE_PREBUILD] Time taken to prebuild problems: {end_time - start_time} seconds")
         return {
-            "method": f"cpp_object_locking_{self._max_threads}",
-            "total_problems": len(problems_data),
-            "successful_problems": total_processed,
-            "total_operations": total_operations,
-            "total_time": total_time,
-            "parallel_time": parallel_time,
-            "theoretical_speedup": theoretical_speedup,
-            "actual_speedup": actual_speedup,
-            "active_threads": len(results),
-            "thread_safe": True,
-        }
-
-    def _build_problems_serial(
-        self,
-        problems_data: List[Tuple[Hashable, List[int], List[List[int]]]],
-    ) -> dict:
-        """Fallback serial processing when thread_safe=False."""
-        start_time = time.perf_counter()
-        processed = 0
-        operations = 0
-        for problem_id, prompt_tokens, sequences in problems_data:
-            for i, token_ids in enumerate(sequences):
-                seq_id = -i - 1
-                self._prebuild_problemtree(seq_id, problem_id, prompt_tokens, token_ids)
-                operations += 2
-            processed += 1
-        total_time = time.perf_counter() - start_time
-        return {
-            "method": "serial_fallback",
-            "total_problems": len(problems_data),
-            "successful_problems": processed,
-            "total_operations": operations,
-            "total_time": total_time,
-            "parallel_time": total_time,
-            "theoretical_speedup": 1.0,
-            "actual_speedup": 1.0,
-            "active_threads": 1,
-            "thread_safe": False,
+            "success": True,
+            "problems_built": total_built,
+            "total_problems": len(problem_data),
         }
