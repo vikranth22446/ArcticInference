@@ -91,6 +91,11 @@ class ProblemIdContextManager:
         _problem_id_context.data['hard_ids'] = hard_ids or []
         _problem_id_context.data['medium_ids'] = medium_ids or []
         _problem_id_context.data['easy_ids'] = easy_ids or []
+        # Invalidate cached indices so they are recomputed for the next batch
+        _problem_id_context.data.pop('hard_indices', None)
+        _problem_id_context.data.pop('medium_indices', None)
+        _problem_id_context.data.pop('easy_indices', None)
+        _problem_id_context.data.pop('allowed_indices', None)
 
     @staticmethod
     def get_hard_medium_ids() -> tuple[Optional[List[str]], Optional[List[str]], Optional[List[str]]]:

@@ -86,11 +86,18 @@ class WorkerBasePatch(ArcticPatch[WorkerBase]):
 
     def activate_prebuilt_cache(self, generation_id):
         return self.model_runner.activate_prebuilt_cache(generation_id)
+
+    def clear_old_suffix_cache(self, generation_id):
+        return self.model_runner.clear_old_suffix_cache(generation_id)
     
     def set_hard_problems(self, hard_problems):
         """Wrapper method to set hard problems on model runner."""
         return self.model_runner.set_hard_problems(hard_problems)
-    
+
+    def set_problem_difficulty(self, hard_ids, medium_ids, easy_ids):
+        """Wrapper method to set hard/medium/easy problem IDs on model runner."""
+        return self.model_runner.set_problem_difficulty(hard_ids, medium_ids, easy_ids)
+
     def get_acceptance_length_metric_for_problems(self, problem_ids):
         """Wrapper method to get acceptance length metrics from model runner."""
         return self.model_runner.get_acceptance_length_metric_for_problems(problem_ids)

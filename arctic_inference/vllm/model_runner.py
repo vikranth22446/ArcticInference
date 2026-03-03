@@ -214,6 +214,7 @@ class SuffixCacheWorkerManager:
         self._current_cache = None
         self._current_generation_id = -1
         self._prebuilt_caches = {}
+        self._stale_caches = []
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="SuffixCache")
         self._lock = threading.Lock()
         self._build_futures = {}
@@ -276,11 +277,20 @@ class SuffixCacheWorkerManager:
                 old_cache = self._current_cache
                 self._current_cache = self._prebuilt_caches.pop(generation_id)
                 self._current_generation_id = generation_id
-                
                 if old_cache:
-                    self._executor.submit(old_cache.clear_all_cache)
+                    self._stale_caches.append(old_cache)
                 return True
         return False
+
+    def clear_old_suffix_cache(self, generation_id):
+        """Clean up stale caches (from activation) and any leftover prebuilt caches in background."""
+        with self._lock:
+            stale_prebuilt_ids = [gid for gid in self._prebuilt_caches if gid < generation_id]
+            caches_to_clear = [self._prebuilt_caches.pop(gid) for gid in stale_prebuilt_ids]
+            caches_to_clear.extend(self._stale_caches)
+            self._stale_caches.clear()
+        for cache in caches_to_clear:
+            self._executor.submit(cache.clear_all_cache)
     
     def shutdown(self):
         for future in self._build_futures.values():
@@ -364,6 +374,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # Buffer config via env with sensible defaults
         self.cpu_timing_buffer: list[dict] = []
         self.gpu_timing_buffer: list[dict] = []
+        self.suffix_stats_buffer: list[str] = []
         self._timing_flush_every_n: int = int(_os.getenv("ARCTIC_TIMING_BUFFER_SIZE", "400"))
         self._timing_flush_every_s: float = float(_os.getenv("ARCTIC_TIMING_FLUSH_SEC", "5"))
         self._timing_last_flush_time: float = _time.monotonic()
@@ -379,8 +390,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self.gpu_timing_file_path = _os.path.join(
             output_dir, f"execution_timing_rank_{rank}_local_{local_rank}_gpu.jsonl"
         )
-        # Ensure buffer flushes on process exit
+        self.suffix_stats_file_path = _os.path.join(
+            output_dir, f"suffix_tree_stats_rank_{rank}_local_{local_rank}.jsonl"
+        )
+        # Ensure buffers flush on process exit
         _atexit.register(lambda: self._flush_timing_buffer(force=True))
+        _atexit.register(lambda: self._flush_suffix_stats_buffer(force=True))
         
         # Initialize tokenizer for text conversion
         self._tokenizer = None
@@ -461,10 +476,10 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
     
 
-        # Get process information for data parallel scenarios
-        local_rank = os.getenv("LOCAL_RANK", "0")
-        world_size = os.getenv("WORLD_SIZE", "1")
-        rank = os.getenv("RANK", "0")
+        # # Get process information for data parallel scenarios
+        # local_rank = os.getenv("LOCAL_RANK", "0")
+        # world_size = os.getenv("WORLD_SIZE", "1")
+        # rank = os.getenv("RANK", "0")
                     # ### Record GPU execution start time for monitoring
         torch.cuda.synchronize()
         execution_start_time = time.perf_counter()
@@ -701,13 +716,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             )
             sampler_output.sampled_token_ids = output_token_ids
 
-        # #### Record GPU execution end time after all GPU computations are complete
-        # torch.cuda.synchronize()
-        # execution_end_time = time.perf_counter()
-        # execution_duration = execution_end_time - execution_start_time
-        # self._log_execution_time(execution_start_timestamp, execution_duration, batch_size, 
-        #                         scheduler_output.total_num_scheduled_tokens, early_return=False)
-
         num_nans_in_logits = {}
         if envs.VLLM_COMPUTE_NANS_IN_LOGITS:
             num_nans_in_logits = self._get_nans_in_logits(logits)
@@ -763,7 +771,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         for i in discard_sampled_tokens_req_indices:
             valid_sampled_token_ids[i].clear()
 
-                        # #### Record GPU execution end time after all GPU computations are complete
+        #                 # #### Record GPU execution end time after all GPU computations are complete
         torch.cuda.synchronize()
         execution_end_time = time.perf_counter()
         execution_duration = execution_end_time - execution_start_time
@@ -823,32 +831,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 spec_decode_metadata,
                 attn_metadata,
             )
-            # Get dynamic configuration or use defaults
-            # dynamic_hard_problems = ProblemIdContextManager.get_dynamic_hard_problems()
-            # dynamic_max_quota = ProblemIdContextManager.get_dynamic_max_quota()
-            
-            # When no dynamic config is set yet (e.g. before first update_hard_problems), use empty set
-            # current_hard_problems = dynamic_hard_problems if dynamic_hard_problems is not None else set()
-            # MAX_SPEC_QUOTA = dynamic_max_quota if dynamic_max_quota is not None else 160
-            
-            # if spec_token_ids is not None:
-            #     hard_indices, non_hard_indices = classify_request_indices(
-            #         self.input_batch.req_ids,
-            #         self._current_batch_req_id_to_problem_id,
-            #         current_hard_problems,
-            #     )
-            #     hard_spec_tokens = sum_tokens_at_indices(spec_token_ids, hard_indices)
-            #     if hard_spec_tokens > MAX_SPEC_QUOTA:
-            #         keep_ratio = MAX_SPEC_QUOTA / hard_spec_tokens
-            #         spec_token_ids = apply_hard_overflow_strategy(
-            #             spec_token_ids, hard_indices, keep_ratio
-            #         )
-            #     else:
-            #         remaining_quota = MAX_SPEC_QUOTA - hard_spec_tokens
-            #         spec_token_ids = apply_non_hard_allocation_strategy(
-            #             spec_token_ids, hard_indices, remaining_quota
-            #         )
-
         # Clear KVConnector state after all KVs are generated.
         if has_kv_transfer_group():
             get_kv_transfer_group().clear_connector_metadata()
@@ -1137,12 +1119,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             seen_req_ids.add(req_id)
             seen_problem_ids.add(problem_id)
 
-            # # Only update suffix cache for hard problems (by problem_id)
-            # problem_id = self._get_problem_id_for_index(i)
-            # if not is_hard_problem(problem_id):
-            #     print(f"DEBUG: Skipping suffix cache update for non-hard problem req_id={req_id}, problem_id={problem_id}")
-            #     continue
-
             if not sampled_ids:
                 continue
 
@@ -1154,7 +1130,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     self.input_batch.token_ids_cpu[index, :num_prompt_tokens])
                 self._suffix_cache.cache_prompt(req_id, prompt_token_ids, problem_id=problem_id)
 
-            #print(f"DEBUG: Updating response for req_id={req_id} with {len(sampled_ids)} tokens")
             self._suffix_cache.update_response(req_id, problem_id, sampled_ids)
 
 
@@ -1201,30 +1176,35 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 results.append(SuffixSpecResult())
                 continue
 
-            if i in hard_indices:
-                current_spec_tokens = hard_spec
-                current_min_prob = hard_prob
-                current_spec_factor = hard_spec_factor
-            elif i in medium_indices:
-                current_spec_tokens = medium_spec
-                current_min_prob = medium_prob
-                current_spec_factor = medium_spec_factor
-            elif end_idx < 4000:
-                results.append(SuffixSpecResult())
-                continue
-            if end_idx > 4000 and end_idx < 8000 and i in easy_indices:
-                current_spec_tokens, current_min_prob, current_spec_factor = (
-                    medium_spec,
-                    medium_prob,
-                    medium_spec_factor,
-                )
-            if end_idx > 8000 and i not in hard_indices:
-                current_spec_tokens, current_min_prob, current_spec_factor = (
+            # if i in hard_indices:
+            #     current_spec_tokens = hard_spec
+            #     current_min_prob = hard_prob
+            #     current_spec_factor = hard_spec_factor
+            # elif i in medium_indices:
+            #     current_spec_tokens = medium_spec
+            #     current_min_prob = medium_prob
+            #     current_spec_factor = medium_spec_factor
+            # elif end_idx < 4000:
+            #     results.append(SuffixSpecResult())
+            #     continue
+            # if end_idx > 4000 and end_idx < 8000 and i in easy_indices:
+            #     current_spec_tokens, current_min_prob, current_spec_factor = (
+            #         medium_spec,
+            #         medium_prob,
+            #         medium_spec_factor,
+            #     )
+            # if end_idx > 8000 and i not in hard_indices:
+            #     current_spec_tokens, current_min_prob, current_spec_factor = (
+            #         hard_spec,
+            #         hard_prob,
+            #         hard_spec_factor,
+            #     )
+        
+            current_spec_tokens, current_min_prob, current_spec_factor = (
                     hard_spec,
                     hard_prob,
                     hard_spec_factor,
                 )
-
             max_spec_tokens = min(
                 MAX_SPEC_LEN - len(spec_ids),
                 config.suffix_cache_max_depth,
@@ -1286,6 +1266,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             self._suffix_cache = self._suffix_cache_manager.get_current_cache()
         return result
 
+    def clear_old_suffix_cache(self, generation_id):
+        self._suffix_cache_manager.clear_old_suffix_cache(generation_id)
+
     def __del__(self):
         self._suffix_cache_manager.shutdown()
     
@@ -1300,7 +1283,11 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     def set_hard_problems(self, hard_problems):
         """Set hard problems via RPC from AsyncLLM."""
         ProblemIdContextManager.set_hard_problems(hard_problems)
-    
+
+    def set_problem_difficulty(self, hard_ids, medium_ids, easy_ids):
+        """Set hard/medium/easy problem IDs for difficulty-aware speculative decoding."""
+        ProblemIdContextManager.set_hard_medium_ids(hard_ids, medium_ids, easy_ids)
+
     def clear_problem_id_cache(self):
         """Clear problem ID cache via RPC from AsyncLLM."""
         ProblemIdContextManager.clear_req_id_mapping()
@@ -1487,6 +1474,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     def _log_execution_time(self, start_timestamp, duration_seconds, batch_size, num_scheduled_tokens,early_return=False,type="cpu"):
         """Log execution time metrics for execute_model calls"""
         try:
+            problem_ids = []
+            context_lens = []
+            if hasattr(self, 'input_batch') and self.input_batch and hasattr(self.input_batch, 'req_ids') and self.input_batch.req_ids:
+                for i, req_id in enumerate(self.input_batch.req_ids):
+                    problem_ids.append(self.get_problem_id_by_request_id(req_id))
+                    ctx_len = int(self.input_batch.num_tokens_no_spec[i]) if hasattr(self.input_batch, 'num_tokens_no_spec') else None
+                    context_lens.append(ctx_len)
+
             timing_data = {
                 "timestamp": start_timestamp,
                 "call_type": "execute_model_timing",
@@ -1494,6 +1489,8 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 "execution_duration_ms": duration_seconds * 1000,
                 "batch_size": batch_size,
                 "num_scheduled_tokens": num_scheduled_tokens,
+                "problem_ids": problem_ids,
+                "context_lens": context_lens,
                 "process_info": {
                     "rank": int(os.getenv("RANK", "0")),
                     "local_rank": int(os.getenv("LOCAL_RANK", "0")),
@@ -1650,28 +1647,26 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         # self._write_token_data_to_file(draft_token_ids, cu_num_draft_tokens, valid_sampled_token_ids)
     
     def _write_suffix_tree_stats(self, stats_data):
-        """Write suffix tree decoding statistics to file with conflict avoidance"""
+        """Buffer suffix tree stats and flush periodically to reduce I/O."""
         try:
-            # Use environment variable for output directory
-            output_dir = os.getenv("ARCTIC_METRICS_DIR", "artic_logs/")
-            os.makedirs(output_dir, exist_ok=True)
-            
-            # Get process info for filename
-            local_rank = os.getenv("LOCAL_RANK", "0")
-            rank = os.getenv("RANK", "0")
-            
-            # Create separate files for each process to avoid conflicts
-            stats_file = os.path.join(output_dir, f"suffix_tree_stats_rank_{rank}_local_{local_rank}.jsonl")
-            
-            # Write with immediate flush to ensure data is written atomically
-            with open(stats_file, "a") as f:
-                f.write(json.dumps(stats_data, default=self._json_serializable) + "\n")
-                f.flush()  # Force immediate write to disk
-                os.fsync(f.fileno())  # Force OS to write to storage
-                
+            self.suffix_stats_buffer.append(json.dumps(stats_data, default=self._json_serializable))
+            if len(self.suffix_stats_buffer) >= self._timing_flush_every_n:
+                self._flush_suffix_stats_buffer()
         except Exception as e:
-            # Log error but don't crash the model
-            logger.error(f"Failed to write suffix tree stats: {e}")
+            logger.error(f"Failed to buffer suffix tree stats: {e}")
+
+    def _flush_suffix_stats_buffer(self, force: bool = False):
+        """Flush buffered suffix tree stats to disk."""
+        try:
+            if not self.suffix_stats_buffer and not force:
+                return
+            if not self.suffix_stats_buffer:
+                return
+            with open(self.suffix_stats_file_path, "a") as f:
+                f.write("\n".join(self.suffix_stats_buffer) + "\n")
+            self.suffix_stats_buffer.clear()
+        except Exception as e:
+            logger.error(f"Failed to flush suffix tree stats: {e}")
     
     def _write_token_data(self, token_data):
         """Write draft and valid token data to a separate file"""

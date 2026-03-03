@@ -159,6 +159,7 @@ class SuffixCache:
         del self._prompt_trees[req_id]
 
     def evict_problem(self, problem_id: Hashable):
+        problem_id = str(problem_id) if problem_id is not None else None
         if problem_id not in self._problem_tree:
             raise ValueError(f"Prompt does not exist for request '{problem_id}'")
         del self._problem_tree[problem_id]
@@ -218,6 +219,7 @@ class SuffixCache:
             - If token_ids is a single integer, it's added as a single token.
             - If token_ids is a sequence, all tokens in the sequence are added.
         """
+        problem_id = str(problem_id) if problem_id is not None else None
         # Thread-safe tree creation
         if problem_id not in self._problem_tree:
             if self._dict_lock:
@@ -267,6 +269,7 @@ class SuffixCache:
             prompt_token_ids: Prompt token sequence
             token_ids: Response token sequence
         """
+        problem_id = str(problem_id) if problem_id is not None else None
         # Thread-safe tree creation
         if problem_id not in self._problem_tree:
             if self._dict_lock:
@@ -331,6 +334,7 @@ class SuffixCache:
             ValueError: If the prompt doesn't exist for the given req_id when
                 use_cached_prompt is True, or if the pattern is invalid.
         """
+        problem_id = str(problem_id) if problem_id is not None else None
         if use_cached_prompt and req_id not in self._prompt_trees:
             raise ValueError(f"Prompt does not exist for request '{req_id}'")
         if problem_id not in self._problem_tree:
@@ -403,6 +407,8 @@ class SuffixCache:
         # Group problems by thread based on hash (for load balancing)
         thread_groups = [[] for _ in range(self._max_threads)]
         for problem_id, prompt_tokens, sequences in problems_data:
+            assert problem_id is not None
+            problem_id = str(problem_id)
             problem_hash = hashlib.md5(str(problem_id).encode()).hexdigest()
             thread_id = int(problem_hash, 16) % self._max_threads
             thread_groups[thread_id].append((problem_id, prompt_tokens, sequences))

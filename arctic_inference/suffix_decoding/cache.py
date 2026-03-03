@@ -25,8 +25,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from arctic_inference.suffix_decoding._C import SuffixTree, Candidate
 
-# Set SUFFIX_CACHE_PROFILE=1 to enable detailed bottleneck analysis for prebuild and cleanup
-_PROFILE_ENABLED = os.environ.get("SUFFIX_CACHE_PROFILE", "0") in ("1", "true", "yes")
 
 
 @dataclass
@@ -68,7 +66,7 @@ class SuffixDecodingCache:
                  max_tree_depth: int = 64,
                  max_cached_requests: int = -1,
                  thread_safe: bool = True,
-                 max_threads: int = 4):
+                 max_threads: int = 8):
         """
         Initialize the SuffixDecodingCache.
 
@@ -132,11 +130,12 @@ class SuffixDecodingCache:
             ValueError: If a request with the same `req_id` is already active
                 or cached.
         """
+        problem_id = str(problem_id)
+        assert problem_id is not None
         if req_id in self._local_trees:
             raise ValueError(f"Request '{req_id}' is already active")
         self._local_trees[req_id] = SuffixTree(self._max_tree_depth)
         self._local_trees[req_id].extend(0, prompt_token_ids)
-        assert problem_id is not None
         if problem_id not in self._problem_tree:
             self._problem_tree[problem_id] = SuffixTree(self._max_tree_depth)
             self._problem_tree[problem_id].extend(0, prompt_token_ids)
@@ -180,6 +179,7 @@ class SuffixDecodingCache:
         """
         if req_id not in self._local_trees:
             raise ValueError(f"Request '{req_id}' is not active")
+        problem_id = str(problem_id) if problem_id is not None else None
         assert problem_id is not None
         
         # Ensure problem tree exists (defensive programming)
@@ -239,6 +239,8 @@ class SuffixDecodingCache:
         """
         if req_id not in self._local_trees:
             raise ValueError(f"Request '{req_id}' is not active")
+
+        problem_id = str(problem_id) if problem_id is not None else None
 
         if max_spec_tokens is None:
             max_spec_tokens = self.max_tree_depth
@@ -301,7 +303,7 @@ class SuffixDecodingCache:
             assert isinstance(item, dict), f"Expected dict at index {i}, got {type(item)}"
             assert 'problem_id' in item, f"Missing 'problem_id' key at index {i}"
             
-            problem_id = item['problem_id']
+            problem_id = str(item['problem_id'])
             sequences = item.get('sequences', [])
             assert isinstance(sequences, list), f"'sequences' must be list at index {i}, got {type(sequences)}"
             
@@ -400,7 +402,7 @@ class SuffixDecodingCache:
         import hashlib
 
         if problem_ids is not None:
-            # Only clean the specified problem_ids that exist in cache; deduplicate so each problem_id is cleared once
+            problem_ids = [str(pid) for pid in problem_ids]
             tree_by_pid = {
                 pid: self._problem_tree[pid]
                 for pid in problem_ids
@@ -409,7 +411,6 @@ class SuffixDecodingCache:
             trees_to_clear = list(tree_by_pid.items())
             clear_full_cache = False
         else:
-            # Clean all problem trees
             trees_to_clear = list(self._problem_tree.items())
             clear_full_cache = True
 
@@ -420,7 +421,6 @@ class SuffixDecodingCache:
         start_time = time.time()
 
         if trees_to_clear:
-            # Group (problem_id, tree) by thread using hash-based load balancing
             thread_groups = [[] for _ in range(self._max_threads)]
             for problem_id, tree in trees_to_clear:
                 tree_hash = hashlib.md5(str(problem_id).encode()).hexdigest()
@@ -428,27 +428,8 @@ class SuffixDecodingCache:
                 thread_groups[thread_idx].append((problem_id, tree))
 
             def cleanup_tree_group(group_data):
-                """Clear a group of trees in one thread"""
-                thread_start = time.perf_counter()
-                cleared_count = 0
-                tree_timings = []  # (problem_id, time_s, num_seqs)
-                for problem_id, tree in group_data:
-                    num_seqs = -1
-                    if _PROFILE_ENABLED:
-                        try:
-                            num_seqs = tree.num_seqs_safe() if hasattr(tree, "num_seqs_safe") else tree.num_seqs()
-                        except Exception:
-                            pass
-                        t0 = time.perf_counter()
+                for _problem_id, tree in group_data:
                     tree.clear()
-                    cleared_count += 1
-                    if _PROFILE_ENABLED:
-                        tree_timings.append((problem_id, time.perf_counter() - t0, num_seqs))
-                return {
-                    "cleared": cleared_count,
-                    "time": time.perf_counter() - thread_start,
-                    "tree_timings": tree_timings if _PROFILE_ENABLED else [],
-                }
 
             num_workers = len([g for g in thread_groups if g])
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
@@ -457,19 +438,8 @@ class SuffixDecodingCache:
                     for group in thread_groups
                     if group
                 ]
-                results = [f.result() for f in as_completed(futures)]
-
-            total_cleared = sum(r["cleared"] for r in results)
-            max_thread_time = max(r["time"] for r in results) if results else 0
-            print(
-                f"Parallel tree clearing: {total_cleared} trees in {max_thread_time:.3f}s "
-                f"using {len(results)} threads"
-            )
-
-            # Profiling: bottleneck analysis for cleanup (enable with SUFFIX_CACHE_PROFILE=1)
-            if _PROFILE_ENABLED and results:
-                print("\n🔍 [CLEANUP] Detailed bottleneck analysis (SUFFIX_CACHE_PROFILE=1):")
-                self._print_cleanup_profile(results, thread_groups)
+                for f in as_completed(futures):
+                    f.result()
 
             if clear_full_cache:
                 self._problem_tree.clear()
@@ -478,18 +448,12 @@ class SuffixDecodingCache:
                 for problem_id, _ in trees_to_clear:
                     self._problem_tree.pop(problem_id, None)
 
-        gc_start = time.perf_counter()
         gc.collect()
-        gc_elapsed = time.perf_counter() - gc_start
         elapsed = time.time() - start_time
-        if _PROFILE_ENABLED and gc_elapsed > 1.0:
-            print(f"📊 [CLEANUP PROFILE] gc.collect() took {gc_elapsed:.2f}s")
         print(
             f"✅ Parallel cleanup completed in {elapsed:.3f}s - {num_to_clear} problem trees cleared"
             + (f", {num_local_trees} local trees" if clear_full_cache else "")
         )
-        if elapsed > 60 and not _PROFILE_ENABLED:
-            print("  💡 Tip: Set SUFFIX_CACHE_PROFILE=1 for detailed bottleneck analysis")
         return {"success": True, "elapsed": elapsed, "cleared_count": num_to_clear}
 
     def get_cache_stats(self) -> dict:
@@ -519,30 +483,3 @@ class SuffixDecodingCache:
         
         return stats
 
-    def _print_cleanup_profile(self, results: list, thread_groups: list) -> None:
-        """Print detailed bottleneck analysis for cleanup when SUFFIX_CACHE_PROFILE=1."""
-        # 1. Thread load imbalance
-        thread_counts = [len(g) for g in thread_groups if g]
-        thread_times = [r["time"] for r in results]
-        print("\n📊 [CLEANUP PROFILE] Thread load analysis:")
-        for i, (count, t) in enumerate(zip(thread_counts, thread_times)):
-            pct = 100 * count / sum(thread_counts) if thread_counts else 0
-            print(f"  Thread {i}: {count} trees ({pct:.1f}%), {t:.2f}s")
-        if thread_times:
-            avg_t = sum(thread_times) / len(thread_times)
-            imbalance = max(thread_times) / avg_t if avg_t > 0 else 1.0
-            print(f"  Load imbalance ratio (max/avg): {imbalance:.2f}x")
-
-        # 2. Per-tree timing: top slowest
-        all_timings = []
-        for r in results:
-            all_timings.extend(r.get("tree_timings", []))
-        if all_timings:
-            all_timings.sort(key=lambda x: x[1], reverse=True)
-            print("\n📊 [CLEANUP PROFILE] Top 10 slowest trees to clear:")
-            for i, (pid, t, num_seqs) in enumerate(all_timings[:10]):
-                seq_info = f", {num_seqs} seqs" if num_seqs >= 0 else ""
-                print(f"  #{i+1} problem_id={pid}: {t:.3f}s{seq_info}")
-            avg_t = sum(x[1] for x in all_timings) / len(all_timings)
-            print(f"\n  Avg per tree: {avg_t:.3f}s")
-            print("  Bottleneck hint: tree.clear() holds C++ mutex during deallocation; large trees serialize")

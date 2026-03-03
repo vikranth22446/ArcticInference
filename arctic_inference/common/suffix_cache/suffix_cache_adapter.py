@@ -35,8 +35,8 @@ class SuffixCacheAdapter(SuffixDecodingCache):
         uses it for start_request. Otherwise uses req_id as placeholder; the
         problem tree will be correctly updated when update_response is called.
         """
-        effective_pid = problem_id if problem_id is not None else req_id
-        self.start_request(req_id, problem_id=effective_pid, prompt_token_ids=prompt_token_ids)
+        assert problem_id is not None
+        self.start_request(req_id, problem_id=problem_id, prompt_token_ids=prompt_token_ids)
 
     def evict_prompt(self, req_id):
         self.stop_request(req_id)
@@ -80,7 +80,7 @@ class SuffixCacheAdapter(SuffixDecodingCache):
         normalized = []
         for problem_id, prompt_tokens, sequences in data:
             normalized.append({
-                "problem_id": problem_id,
+                "problem_id": str(problem_id),
                 "sequences": [
                     {
                         "seq_id": -i - 1,
@@ -124,7 +124,7 @@ class SuffixCacheAdapter(SuffixDecodingCache):
             assert isinstance(item, dict), f"Expected dict at index {i}, got {type(item)}"
             assert "problem_id" in item, f"Missing 'problem_id' key at index {i}"
 
-            problem_id = item["problem_id"]
+            problem_id = str(item["problem_id"])
             sequences = item.get("sequences", [])
             assert isinstance(sequences, list), (
                 f"'sequences' must be list at index {i}, got {type(sequences)}"
@@ -157,6 +157,7 @@ class SuffixCacheAdapter(SuffixDecodingCache):
 
         def prebuild_problem_group(group_data):
             """Pre-build a group of problems in one thread"""
+
             built_count = 0
 
             for seq_id, problem_id, prompt_tokens, response_tokens in group_data:
@@ -195,7 +196,7 @@ class SuffixCacheAdapter(SuffixDecodingCache):
         total_built = sum(r["built"] for r in results)
 
         end_time = time.time()
-        print(f"[SUFFIX_CACHE_PREBUILD] Time taken to prebuild problems: {end_time - start_time} seconds")
+        print(f"[SUFFIX_CACHE_PREBUILD] Time taken to prebuild problems: {end_time - start_time} seconds, for {total_built} problems")
         return {
             "success": True,
             "problems_built": total_built,
