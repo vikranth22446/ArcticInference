@@ -248,15 +248,127 @@ class SuffixCacheWorkerManager:
         if generation_id in self._build_futures:
             old_future = self._build_futures.pop(generation_id)
             old_future.cancel()
+        enqueue_ts = time.perf_counter()
+
+        def _load_problem_data_from_file_refs(payload):
+            """
+            Build old-format problems_data from lightweight file references.
+
+            Payload format:
+                {
+                    "mode": "file_ref_v1",
+                    "token_ids_dir": "<...>/generation_token_ids",
+                    "steps_needed_by_pid": {"pid": [step1, step2, ...], ...}
+                }
+            Returns:
+                List[Tuple[problem_id, None, sequences]]
+            """
+            mode = payload.get("mode")
+            if mode != "file_ref_v1":
+                return payload
+
+            token_ids_dir = payload.get("token_ids_dir")
+            steps_needed_by_pid = payload.get("steps_needed_by_pid", {})
+            if not token_ids_dir or not isinstance(steps_needed_by_pid, dict):
+                print(
+                    f"[SUFFIX_CACHE] Invalid file_ref payload for generation_id={generation_id}: "
+                    f"token_ids_dir={token_ids_dir}, steps_needed_by_pid_type={type(steps_needed_by_pid)}",
+                    flush=True,
+                )
+                return []
+
+            if not os.path.isdir(token_ids_dir):
+                print(
+                    f"[SUFFIX_CACHE] token_ids_dir does not exist for generation_id={generation_id}: {token_ids_dir}",
+                    flush=True,
+                )
+                return []
+
+            normalized_steps_by_pid: dict[str, set[int]] = {}
+            for pid, steps in steps_needed_by_pid.items():
+                pid_str = str(pid)
+                if not isinstance(steps, list):
+                    continue
+                normalized_steps = set()
+                for s in steps:
+                    if not isinstance(s, (int, str)):
+                        continue
+                    try:
+                        normalized_steps.add(int(s))
+                    except (TypeError, ValueError):
+                        continue
+                normalized_steps_by_pid[pid_str] = normalized_steps
+
+            if not normalized_steps_by_pid:
+                return []
+
+            step_to_pids: dict[int, set[str]] = {}
+            for pid, steps in normalized_steps_by_pid.items():
+                for step in steps:
+                    step_to_pids.setdefault(step, set()).add(pid)
+
+            all_steps = sorted(step_to_pids.keys())
+            pid_to_sequences: dict[str, list[list[int]]] = {
+                pid: [] for pid in normalized_steps_by_pid
+            }
+
+            io_start = time.perf_counter()
+            for step in all_steps:
+                file_path = os.path.join(token_ids_dir, f"{step}.jsonl")
+                if not os.path.exists(file_path):
+                    continue
+                required_pids = step_to_pids[step]
+                with open(file_path, "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            entry = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        entry_pid = str(entry.get("problem_id", ""))
+                        if entry_pid not in required_pids:
+                            continue
+                        response_ids = entry.get("response_token_ids")
+                        if isinstance(response_ids, list) and response_ids:
+                            pid_to_sequences[entry_pid].append(response_ids)
+
+            io_end = time.perf_counter()
+            problems_data_from_files = [
+                (pid, None, seqs) for pid, seqs in pid_to_sequences.items() if seqs
+            ]
+            total_seqs = sum(len(seqs) for _, _, seqs in problems_data_from_files)
+            print(
+                f"[PREBUILD_TIMING] generation_id={generation_id} worker_file_ref_load_s="
+                f"{(io_end - io_start):.3f} problems={len(problems_data_from_files)} sequences={total_seqs} "
+                f"steps={len(all_steps)}",
+                flush=True,
+            )
+            return problems_data_from_files
         
         def _build():
+            build_start_ts = time.perf_counter()
+            queue_wait_s = build_start_ts - enqueue_ts
+            print(
+                f"[PREBUILD_TIMING] generation_id={generation_id} worker_build_queue_wait_s={queue_wait_s:.3f}",
+                flush=True,
+            )
             try:
                 cache = SuffixCache(**cache_params)
-                if problems_data:
-                    cache.prebuild_problems_parallel(problems_data)
+                resolved_problem_data = _load_problem_data_from_file_refs(problems_data) \
+                    if isinstance(problems_data, dict) else problems_data
+                if resolved_problem_data:
+                    cache.prebuild_problems_parallel(resolved_problem_data)
                 
                 with self._lock:
                     self._prebuilt_caches[generation_id] = cache
+                build_end_ts = time.perf_counter()
+                print(
+                    f"[PREBUILD_TIMING] generation_id={generation_id} worker_build_total_s="
+                    f"{(build_end_ts - build_start_ts):.3f}",
+                    flush=True,
+                )
                 return cache
             except Exception as e:
                 logger.error(f"Failed to prebuild cache for generation {generation_id}: {e}")
@@ -1211,19 +1323,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 self.max_model_len - end_idx - 1,
                 current_spec_tokens,
             )
-
-            # max_spec_offset is modified to mimic the behavior of the original
-            # max_spec_factor and max_spec_offset as if the speculative tokens
-            # were generated by suffix decoding. For example, if:
-            #   - max_spec_factor = 2
-            #   - max_spec_offset = -1
-            #   - we've already speculated 3 tokens
-            #   - and the suffix match length is 6
-            # Then:
-            #   - The match length before the already-speculated tokens is 3
-            #   - The original config allow up to 5 speculated tokens total
-            #   - Already speculated 3 tokens, so should allow 2 more tokens
-            # So the new config should map match length 6 to 2 max spec tokens.
             max_spec_factor = current_spec_factor
             max_spec_offset = config.suffix_max_spec_offset - len(spec_ids) * (
                 max_spec_factor + 1
@@ -1261,6 +1360,16 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         return self._suffix_cache_manager.prebuild_cache_async(generation_id, cache_params, problems_data)
 
     def activate_prebuilt_cache(self, generation_id):
+        mgr = self._suffix_cache_manager
+        with mgr._lock:
+            available_prebuilt_generation_ids = sorted(mgr._prebuilt_caches.keys())
+            current_generation_id = mgr._current_generation_id
+        print(
+            f"[SUFFIX_CACHE] worker activate_prebuilt_cache request generation_id={generation_id}, "
+            f"current_generation_id={current_generation_id}, "
+            f"available_prebuilt_generation_ids={available_prebuilt_generation_ids}",
+            flush=True,
+        )
         result = self._suffix_cache_manager.activate_prebuilt_cache(generation_id)
         if result:
             self._suffix_cache = self._suffix_cache_manager.get_current_cache()

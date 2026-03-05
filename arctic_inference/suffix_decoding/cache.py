@@ -90,6 +90,8 @@ class SuffixDecodingCache:
         
         # Problem trees cache responses for each problem separately
         self._problem_tree = {}
+        # Avoid flooding logs: print missing problem_tree warning once per problem_id.
+        self._missing_problem_tree_warned = set()
         
     @property
     def max_tree_depth(self) -> int:
@@ -272,6 +274,16 @@ class SuffixDecodingCache:
             if problem_candidate.score > result.score:
                 result = SuffixDecodingDraft.from_candidate(problem_candidate)
                 source = f"problem_{problem_id}"
+        else:
+            # Explicit debug print requested by user:
+            # when problem_id is not in problem_tree, speculation can only use local tree.
+            if problem_id not in self._missing_problem_tree_warned:
+                print(
+                    f"[SUFFIX_CACHE] problem_id={problem_id} not found in _problem_tree; "
+                    f"fallback to local tree only (req_id={req_id})",
+                    flush=True,
+                )
+                self._missing_problem_tree_warned.add(problem_id)
         return result, source
 
     def prebuild_problems_parallel(
