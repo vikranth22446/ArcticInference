@@ -529,30 +529,42 @@ size_t SuffixTree::estimate_memory() const {
 }
 
 // Thread-safe implementations with per-object locking
+// Write operations use unique_lock (exclusive), read operations use shared_lock
 
 void SuffixTree::append_safe(int seq_id, int token) {
-    std::lock_guard<std::mutex> lock(_tree_mutex);
+    std::unique_lock<std::shared_mutex> lock(_tree_mutex);
     append(seq_id, token);
 }
 
 void SuffixTree::extend_safe(int seq_id, const std::vector<int>& tokens) {
-    std::lock_guard<std::mutex> lock(_tree_mutex);
+    std::unique_lock<std::shared_mutex> lock(_tree_mutex);
     extend(seq_id, tokens);
 }
 
 void SuffixTree::remove_safe(int seq_id) {
-    std::lock_guard<std::mutex> lock(_tree_mutex);
+    std::unique_lock<std::shared_mutex> lock(_tree_mutex);
     remove(seq_id);
 }
 
 int SuffixTree::num_seqs_safe() const {
-    std::lock_guard<std::mutex> lock(_tree_mutex);
+    std::shared_lock<std::shared_mutex> lock(_tree_mutex);
     return static_cast<int>(_seqs.size());
+}
+
+Candidate SuffixTree::speculate_safe(const std::vector<int>& pattern,
+                                     int max_spec_tokens,
+                                     float max_spec_factor,
+                                     float max_spec_offset,
+                                     float min_token_prob,
+                                     bool use_tree_spec) {
+    std::shared_lock<std::shared_mutex> lock(_tree_mutex);
+    return speculate(pattern, max_spec_tokens, max_spec_factor,
+                     max_spec_offset, min_token_prob, use_tree_spec);
 }
 
 
 void SuffixTree::clear() {
-    std::lock_guard<std::mutex> lock(_tree_mutex);
+    std::unique_lock<std::shared_mutex> lock(_tree_mutex);
     
     // Simple approach: just recreate the root node
     // The unique_ptr will handle recursive destruction automatically

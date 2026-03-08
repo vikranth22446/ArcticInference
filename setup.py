@@ -179,8 +179,6 @@ class CompileGrpc(_build_py):
 
 setup(
     ext_modules=[
-        CMakeExtension("arctic_inference.common.suffix_cache._C",
-                       "csrc/suffix_cache"),
         CMakeExtension("arctic_inference.custom_ops", "csrc/custom_ops"),
         CMakeExtension("arctic_inference.suffix_decoding._C", "csrc/suffix_decoding"), 
     ],

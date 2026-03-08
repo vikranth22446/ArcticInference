@@ -30,8 +30,7 @@ import pandas as pd
 from tqdm import tqdm
 from transformers import AutoTokenizer
 
-# Import suffix cache
-from arctic_inference.common.suffix_cache import SuffixCache
+from arctic_inference.suffix_decoding import SuffixDecodingCache, SuffixDecodingDraft
 
 try:
     from .vis_tree import SuffixTreeVisualizer
@@ -49,7 +48,7 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 
 def suffix_decode(
-    suffix_cache: SuffixCache,
+    suffix_cache: SuffixDecodingCache,
     request_id: int,
     problem_id: int,
     prompt: List[int],
@@ -63,10 +62,10 @@ def suffix_decode(
     tokenizer = None,
 ) -> List[Dict]:
     if not max_spec_tokens:
-        max_spec_tokens = suffix_cache.max_depth
+        max_spec_tokens = suffix_cache.max_tree_depth
 
     if use_cached_prompt:
-        suffix_cache.cache_prompt(request_id, prompt)
+        suffix_cache.start_request(request_id, problem_id=problem_id, prompt_token_ids=prompt)
 
     assert isinstance(prompt, list) and isinstance(ground_truth_response, list)
 
@@ -83,20 +82,19 @@ def suffix_decode(
         pattern = text[-16:]
 
         start_time = time.perf_counter()
-        result = suffix_cache.speculate(
+        result, _source = suffix_cache.speculate(
             request_id,
-            problem_id,
             pattern,
             max_spec_tokens=max_spec_tokens,
             max_spec_factor=max_spec_factor,
             min_token_prob=min_token_prob,
             use_tree_spec=use_tree_spec,
-            use_cached_prompt=True,
+            problem_id=problem_id,
         )
         end_time = time.perf_counter()
         spec_time = end_time - start_time
 
-        # Verify scpeculated tokens
+        # Verify speculated tokens
         accepted_tokens = []
         node = -1
         for token_id in ground_truth_response[len(response):]:
@@ -117,7 +115,6 @@ def suffix_decode(
         bonus_token = None
         bonus_text = ""
         if len(response) < len(ground_truth_response):
-            # Add bonus token
             bonus_token = ground_truth_response[len(response)]
             new_tokens.append(bonus_token)
             response.append(bonus_token)
@@ -127,24 +124,20 @@ def suffix_decode(
 
         # Debug output for each step (after all tokens are processed)
         if debug_file:
-            # Match tokens (from result.match_len)
             match_tokens = text[-result.match_len:] if result.match_len > 0 else []
             match_text = ""
             if tokenizer and match_tokens:
                 match_text = tokenizer.decode(match_tokens, skip_special_tokens=True)
             
-            # Spec tokens (all speculated tokens)
             spec_tokens = result.token_ids
             spec_text = ""
             if tokenizer and spec_tokens:
                 spec_text = tokenizer.decode(spec_tokens, skip_special_tokens=True)
             
-            # Accept tokens (accepted tokens)
             accept_text = ""
             if tokenizer and accepted_tokens:
                 accept_text = tokenizer.decode(accepted_tokens, skip_special_tokens=True)
             
-            # Create JSON object for this step with all information
             debug_data = {
                 "request_id": request_id,
                 "step": step_counter,
@@ -168,7 +161,7 @@ def suffix_decode(
 
         # Update suffix cache
         start_time = time.perf_counter()
-        suffix_cache.update_response(request_id, problem_id, new_tokens)
+        suffix_cache.add_active_response(request_id, problem_id, new_tokens)
         end_time = time.perf_counter()
         update_time = end_time - start_time
 
@@ -187,12 +180,11 @@ def suffix_decode(
 
     assert response == ground_truth_response
 
-    # Close debug file
     if debug_file:
         debug_file.close()
 
     if use_cached_prompt:
-        suffix_cache.evict_prompt(request_id)
+        suffix_cache.stop_request(request_id)
 
     return results
 
@@ -254,16 +246,23 @@ def process_task(
         num_train,
         seed,
     )
-    suffix_cache = SuffixCache(max_depth)
+    suffix_cache = SuffixDecodingCache(max_tree_depth=max_depth)
+
+    # Build problem trees from training data using prebuild
+    problems_data = {}
     for request_id, example in tqdm(train_subset.iterrows(),
                                     total=len(train_subset),
                                     desc=f"Building cache"):
-        # Use negative request_id to indicate training examples and avoid
-        # conflicts with eval request_ids numbered 0, .., num_eval - 1.
-        # Use the real problem_id from data
-        problem_id = example["problem_id"]
-        suffix_cache.update_response(-1 - request_id, problem_id, example["prompt"])
-        suffix_cache.update_response(-1 - request_id, problem_id, example["response"])
+        problem_id = str(example["problem_id"])
+        if problem_id not in problems_data:
+            problems_data[problem_id] = {"problem_id": problem_id, "sequences": []}
+        problems_data[problem_id]["sequences"].append({
+            "seq_id": -1 - request_id,
+            "prompt_tokens": example["prompt"],
+            "response_tokens": example["response"],
+        })
+    if problems_data:
+        suffix_cache.prebuild_problems_parallel(list(problems_data.values()))
 
     # # Visualize the suffix tree after building
     # if enable_visualization and SuffixTreeVisualizer is not None:

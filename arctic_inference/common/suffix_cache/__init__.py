@@ -12,10 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import os
-if os.getenv("ARCTIC_USE_SUFFIX_DECODING", "0") == "1":
-    from .suffix_cache_adapter import SuffixCacheAdapter as SuffixCache
-    from arctic_inference.suffix_decoding import SuffixDecodingDraft as SuffixSpecResult
-else:
-    from .suffix_cache import SuffixCache, SuffixSpecResult
+
+from arctic_inference.suffix_decoding import SuffixDecodingCache as SuffixCache
+from arctic_inference.suffix_decoding import SuffixDecodingDraft as SuffixSpecResult
+
 __all__ = ["SuffixCache", "SuffixSpecResult"]

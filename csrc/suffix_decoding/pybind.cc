@@ -31,10 +31,22 @@ PYBIND11_MODULE(_C, m) {
     py::class_<SuffixTree>(m, "SuffixTree")
         .def(py::init<int>())
         .def("num_seqs", &SuffixTree::num_seqs)
-        .def("append", &SuffixTree::append)
-        .def("extend", &SuffixTree::extend)
-        .def("remove", &SuffixTree::remove)
-        .def("clear", &SuffixTree::clear)
+        .def("append", &SuffixTree::append,
+             py::call_guard<py::gil_scoped_release>())
+        .def("extend", &SuffixTree::extend,
+             py::call_guard<py::gil_scoped_release>())
+        .def("remove", &SuffixTree::remove,
+             py::call_guard<py::gil_scoped_release>())
+        .def("clear", &SuffixTree::clear,
+             py::call_guard<py::gil_scoped_release>())
+        .def("speculate", &SuffixTree::speculate,
+             py::arg("pattern"),
+             py::arg("max_spec_tokens"),
+             py::arg("max_spec_factor") = 1.0f,
+             py::arg("max_spec_offset") = 0.0f,
+             py::arg("min_token_prob") = 0.1f,
+             py::arg("use_tree_spec") = false,
+             py::call_guard<py::gil_scoped_release>())
         .def("append_safe", &SuffixTree::append_safe, 
              py::call_guard<py::gil_scoped_release>(),
              "Thread-safe append with per-object locking and GIL release")
@@ -47,7 +59,15 @@ PYBIND11_MODULE(_C, m) {
         .def("num_seqs_safe", &SuffixTree::num_seqs_safe,
              py::call_guard<py::gil_scoped_release>(),
              "Thread-safe num_seqs with per-object locking and GIL release")
-        .def("speculate", &SuffixTree::speculate)
+        .def("speculate_safe", &SuffixTree::speculate_safe,
+             py::arg("pattern"),
+             py::arg("max_spec_tokens"),
+             py::arg("max_spec_factor") = 1.0f,
+             py::arg("max_spec_offset") = 0.0f,
+             py::arg("min_token_prob") = 0.1f,
+             py::arg("use_tree_spec") = false,
+             py::call_guard<py::gil_scoped_release>(),
+             "Thread-safe speculate with per-object locking and GIL release")
         .def("check_integrity", &SuffixTree::check_integrity)
         .def("estimate_memory", &SuffixTree::estimate_memory);
 }

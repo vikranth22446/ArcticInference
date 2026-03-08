@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Hashable, KeysView, List, Optional, Sequence, Union, Tuple
+from typing import Hashable, KeysView, List, Optional, Sequence, Union
 import gc
 import os
 import threading
@@ -66,7 +66,9 @@ class SuffixDecodingCache:
                  max_tree_depth: int = 64,
                  max_cached_requests: int = -1,
                  thread_safe: bool = True,
-                 max_threads: int = 8):
+                 max_threads: int = 8,
+                 *,
+                 max_depth: Optional[int] = None):
         """
         Initialize the SuffixDecodingCache.
 
@@ -77,7 +79,12 @@ class SuffixDecodingCache:
                 means no limit on the number of cached requests.
             thread_safe (bool): Whether to use thread-safe operations
             max_threads (int): Maximum number of threads for parallel operations
+            max_depth (int, optional): Alias for max_tree_depth for backward
+                compatibility. If provided, overrides max_tree_depth.
         """
+        if max_depth is not None:
+            max_tree_depth = max_depth
+
         if max_cached_requests > 0x7FFFFFFF:
             raise ValueError("max_cached_requests must be at most 2^31")
 
@@ -98,8 +105,21 @@ class SuffixDecodingCache:
         return self._max_tree_depth
 
     @property
+    def max_depth(self) -> int:
+        """Alias for max_tree_depth for backward compatibility."""
+        return self._max_tree_depth
+
+    @property
     def max_cached_requests(self) -> int:
         return self._max_cached_requests
+
+    def has_cached_prompt(self, req_id) -> bool:
+        """Check if a prompt is cached for the given request ID."""
+        return req_id in self._local_trees
+
+    def clear_all_cache(self):
+        """Alias for clear_cache(problem_ids=None) for backward compatibility."""
+        self.clear_cache(problem_ids=None)
 
     @property
     def active_requests(self) -> KeysView:
@@ -185,23 +205,14 @@ class SuffixDecodingCache:
         assert problem_id is not None
         
         # Ensure problem tree exists (defensive programming)
-        # if problem_id not in self._problem_tree:
-        #     self._problem_tree[problem_id] = SuffixTree(self._max_tree_depth)
+        if problem_id not in self._problem_tree:
+            self._problem_tree[problem_id] = SuffixTree(self._max_tree_depth)
         
+        local_tree = self._local_trees[req_id]
         if isinstance(token_ids, Sequence):
-            if self._thread_safe:
-                # self._problem_tree[problem_id].extend_safe(0, token_ids)
-                self._local_trees[req_id].extend_safe(0, token_ids)
-            else:
-                # self._problem_tree[problem_id].extend(0, token_ids)
-                self._local_trees[req_id].extend(0, token_ids)
+            local_tree.extend(0, token_ids)
         else:
-            if self._thread_safe:
-                # self._problem_tree[problem_id].append_safe(0, token_ids)
-                self._local_trees[req_id].append_safe(0, token_ids)
-            else:
-                # self._problem_tree[problem_id].append(0, token_ids)
-                self._local_trees[req_id].append(0, token_ids)
+            local_tree.append(0, token_ids)
 
     def speculate(
         self,
@@ -294,8 +305,7 @@ class SuffixDecodingCache:
         Pre-build multiple problem trees in parallel using ThreadPoolExecutor.
         
         Args:
-            problem_data: List of dict format: 
-                         {'problem_id': pid, 'sequences': [{'seq_id': int, 'prompt_tokens': list, 'response_tokens': list}, ...]}
+            problem_data: [{'problem_id': pid, 'sequences': [{'seq_id': int, 'prompt_tokens': list, 'response_tokens': list}, ...]}, ...]
         
         Returns:
             dict: Results containing success status and statistics
@@ -348,12 +358,8 @@ class SuffixDecodingCache:
                     
                     tree = self._problem_tree[problem_id]
                     
-                    # Use thread-safe methods if enabled (with GIL release)
                     if prompt_tokens or response_tokens:
-                        if self._thread_safe:
-                            tree.extend_safe(seq_id, prompt_tokens + response_tokens)
-                        else:
-                            tree.extend(seq_id, prompt_tokens + response_tokens)
+                        tree.extend(seq_id, prompt_tokens + response_tokens)
                     
                     built_count += 1
                     
@@ -367,7 +373,7 @@ class SuffixDecodingCache:
         
         # Execute parallel prebuild with ThreadPoolExecutor
         max_workers = len([g for g in thread_groups if g])
-        print(f"debug:max_workers: {max_workers}")
+        # print(f"debug:max_workers: {max_workers}")
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = []
             for i, group in enumerate(thread_groups):
@@ -473,7 +479,6 @@ class SuffixDecodingCache:
         stats = {
             "max_tree_depth": self._max_tree_depth,
             "max_cached_requests": self._max_cached_requests,
-            "thread_safe": self._thread_safe,
             "max_threads": self._max_threads,
             "problem_tree_count": len(self._problem_tree),
             "local_tree_count": len(self._local_trees),

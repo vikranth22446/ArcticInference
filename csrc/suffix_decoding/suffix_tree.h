@@ -22,6 +22,7 @@
 #include <utility>
 #include <vector>
 #include <mutex>
+#include <shared_mutex>
 
 #include "int32_map.h"
 
@@ -109,6 +110,14 @@ public:
                         float min_token_prob = 0.1f,
                         bool use_tree_spec = false);
 
+    // Thread-safe speculate with per-object locking
+    Candidate speculate_safe(const std::vector<int>& pattern,
+                        int max_spec_tokens,
+                        float max_spec_factor = 1.0f,
+                        float max_spec_offset = 0.0f,
+                        float min_token_prob = 0.1f,
+                        bool use_tree_spec = false);
+
     // Check the integrity of the suffix tree, return empty string if ok,
     // otherwise return an error message.
     std::string check_integrity();
@@ -122,8 +131,8 @@ public:
 
 private:
 
-    // Per-object mutex for thread safety
-    mutable std::mutex _tree_mutex;
+    // Per-object mutex for thread safety (shared_mutex allows concurrent reads)
+    mutable std::shared_mutex _tree_mutex;
 
     // Maximum depth of the suffix tree.
     int _max_depth;

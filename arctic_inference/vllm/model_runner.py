@@ -57,11 +57,10 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner, logger
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
-from arctic_inference.common.suffix_cache import SuffixCache
+from arctic_inference.suffix_decoding import SuffixDecodingCache, SuffixDecodingDraft
 from arctic_inference.patching import ArcticPatch
 from arctic_inference.vllm.context_managers import ProblemIdContextManager
 from arctic_inference.vllm.spec_dec.arctic_proposer import ArcticProposer
-from arctic_inference.common.suffix_cache import SuffixSpecResult
 
 SP_TP_MODE = None
 # Configuration for hard problems only suffix decoding
@@ -231,7 +230,7 @@ class SuffixCacheWorkerManager:
         if generation_id <= self._current_generation_id:
             return False
             
-        new_cache = SuffixCache(**cache_params)
+        new_cache = SuffixDecodingCache(**cache_params)
         if problems_data:
             new_cache.prebuild_problems_parallel(problems_data)
         
@@ -252,7 +251,7 @@ class SuffixCacheWorkerManager:
 
         def _load_problem_data_from_file_refs(payload):
             """
-            Build old-format problems_data from lightweight file references.
+            Build problems_data from lightweight file references.
 
             Payload format:
                 {
@@ -261,7 +260,7 @@ class SuffixCacheWorkerManager:
                     "steps_needed_by_pid": {"pid": [step1, step2, ...], ...}
                 }
             Returns:
-                List[Tuple[problem_id, None, sequences]]
+                List[dict] in canonical format for prebuild_problems_parallel.
             """
             mode = payload.get("mode")
             if mode != "file_ref_v1":
@@ -335,10 +334,18 @@ class SuffixCacheWorkerManager:
                             pid_to_sequences[entry_pid].append(response_ids)
 
             io_end = time.perf_counter()
-            problems_data_from_files = [
-                (pid, None, seqs) for pid, seqs in pid_to_sequences.items() if seqs
-            ]
-            total_seqs = sum(len(seqs) for _, _, seqs in problems_data_from_files)
+            problems_data_from_files = []
+            total_seqs = 0
+            for pid, seqs in pid_to_sequences.items():
+                if seqs:
+                    problems_data_from_files.append({
+                        "problem_id": pid,
+                        "sequences": [
+                            {"seq_id": -i - 1, "prompt_tokens": [], "response_tokens": s}
+                            for i, s in enumerate(seqs)
+                        ],
+                    })
+                    total_seqs += len(seqs)
             print(
                 f"[PREBUILD_TIMING] generation_id={generation_id} worker_file_ref_load_s="
                 f"{(io_end - io_start):.3f} problems={len(problems_data_from_files)} sequences={total_seqs} "
@@ -355,7 +362,7 @@ class SuffixCacheWorkerManager:
                 flush=True,
             )
             try:
-                cache = SuffixCache(**cache_params)
+                cache = SuffixDecodingCache(**cache_params)
                 resolved_problem_data = _load_problem_data_from_file_refs(problems_data) \
                     if isinstance(problems_data, dict) else problems_data
                 if resolved_problem_data:
@@ -1240,9 +1247,9 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 num_prompt_tokens = self.input_batch.num_prompt_tokens[index]
                 prompt_token_ids = (
                     self.input_batch.token_ids_cpu[index, :num_prompt_tokens])
-                self._suffix_cache.cache_prompt(req_id, prompt_token_ids, problem_id=problem_id)
+                self._suffix_cache.start_request(req_id, problem_id=problem_id, prompt_token_ids=prompt_token_ids)
 
-            self._suffix_cache.update_response(req_id, problem_id, sampled_ids)
+            self._suffix_cache.add_active_response(req_id, problem_id, sampled_ids)
 
 
     def propose_suffix_draft_token_ids(
@@ -1270,7 +1277,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             num_sampled_ids = len(sampled_ids)
             if not num_sampled_ids:
                 # Skip speculative decoding.
-                results.append(SuffixSpecResult())
+                results.append(SuffixDecodingDraft())
                 continue
 
             req_id = self.input_batch.req_ids[i]
@@ -1285,7 +1292,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 pattern = pattern[-config.suffix_cache_max_depth :]
 
             if end_idx >= self.max_model_len:
-                results.append(SuffixSpecResult())
+                results.append(SuffixDecodingDraft())
                 continue
 
             # if i in hard_indices:
@@ -1297,7 +1304,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             #     current_min_prob = medium_prob
             #     current_spec_factor = medium_spec_factor
             # elif end_idx < 4000:
-            #     results.append(SuffixSpecResult())
+            #     results.append(SuffixDecodingDraft())
             #     continue
             # if end_idx > 4000 and end_idx < 8000 and i in easy_indices:
             #     current_spec_tokens, current_min_prob, current_spec_factor = (
@@ -1328,14 +1335,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 max_spec_factor + 1
             )
 
-            result = self._suffix_cache.speculate(
+            result, _source = self._suffix_cache.speculate(
                 req_id,
-                problem_id,
                 pattern,
                 max_spec_tokens=max_spec_tokens,
                 max_spec_factor=max_spec_factor,
                 max_spec_offset=max_spec_offset,
                 min_token_prob=current_min_prob,
+                problem_id=problem_id,
             )
 
             results.append(result)

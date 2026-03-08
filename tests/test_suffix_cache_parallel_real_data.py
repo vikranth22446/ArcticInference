@@ -21,8 +21,8 @@ from typing import List, Tuple, Any, Dict
 sys.path.append('/app/src/ArcticInference')
 
 try:
-    from arctic_inference.common.suffix_cache.suffix_cache import SuffixCache
-    print("✅ 成功导入 SuffixCache")
+    from arctic_inference.suffix_decoding import SuffixDecodingCache
+    print("✅ 成功导入 SuffixDecodingCache")
 except ImportError as e:
     print(f"❌ 导入失败: {e}")
     print("提示：请确保在Docker环境中运行此测试")
@@ -34,11 +34,10 @@ class TestSuffixCacheParallel:
         self.data_file = data_file
         self.test_problems = []
         
-    def load_real_data(self, max_problems: int = 20, max_seqs_per_problem: int = 8) -> List[Tuple[str, List[int], List[List[int]]]]:
-        """加载真实的JSONL数据并转换为测试格式"""
+    def load_real_data(self, max_problems: int = 20, max_seqs_per_problem: int = 8) -> List[Dict]:
+        """加载真实的JSONL数据并转换为canonical dict格式"""
         print(f"📁 从 {self.data_file} 加载数据...")
         
-        problems_data = []
         problem_groups = defaultdict(list)
         
         try:
@@ -50,40 +49,44 @@ class TestSuffixCacheParallel:
                     try:
                         data = json.loads(line.strip())
                         
-                        # 提取数据字段
                         if "token_ids" in data and "problem_id" in data:
                             problem_id = data["problem_id"]
                             token_ids = data["token_ids"]
                             
-                            # 简单的prompt: 取前100个token作为prompt
                             if len(token_ids) > 150:
                                 prompt_tokens = token_ids[:100]
-                                response_tokens = token_ids[100:150]  # 限制长度避免过慢
+                                response_tokens = token_ids[100:150]
                                 problem_groups[problem_id].append((prompt_tokens, response_tokens))
                                 
-                    except (json.JSONDecodeError, KeyError) as e:
+                    except (json.JSONDecodeError, KeyError):
                         continue
         
         except FileNotFoundError:
             print(f"❌ 数据文件不存在: {self.data_file}")
-            # 生成模拟数据作为备选
             return self._generate_mock_data(max_problems, max_seqs_per_problem)
         
-        # 转换为测试格式
+        problems_data = []
         for problem_id, sequences in list(problem_groups.items())[:max_problems]:
             if sequences:
-                # 使用第一个序列的prompt作为基准prompt
                 base_prompt = sequences[0][0]
                 response_sequences = [seq[1] for seq in sequences[:max_seqs_per_problem]]
-                problems_data.append((problem_id, base_prompt, response_sequences))
+                problems_data.append({
+                    "problem_id": str(problem_id),
+                    "sequences": [
+                        {"seq_id": -i - 1, "prompt_tokens": base_prompt, "response_tokens": resp}
+                        for i, resp in enumerate(response_sequences)
+                    ],
+                })
         
         print(f"✅ 加载了 {len(problems_data)} 个问题的真实数据")
-        for i, (pid, prompt, seqs) in enumerate(problems_data[:3]):
-            print(f"  问题 {i}: {pid}, prompt长度={len(prompt)}, 序列数={len(seqs)}")
+        for i, item in enumerate(problems_data[:3]):
+            n_seqs = len(item["sequences"])
+            prompt_len = len(item["sequences"][0]["prompt_tokens"]) if n_seqs else 0
+            print(f"  问题 {i}: {item['problem_id']}, prompt长度={prompt_len}, 序列数={n_seqs}")
         
         return problems_data
     
-    def _generate_mock_data(self, max_problems: int, max_seqs_per_problem: int) -> List[Tuple[str, List[int], List[List[int]]]]:
+    def _generate_mock_data(self, max_problems: int, max_seqs_per_problem: int) -> List[Dict]:
         """生成模拟数据作为备选"""
         print("🔄 生成模拟数据...")
         problems_data = []
@@ -91,29 +94,45 @@ class TestSuffixCacheParallel:
         for i in range(max_problems):
             problem_id = f"mock_problem_{i}"
             prompt_tokens = [random.randint(1, 5000) for _ in range(100)]
-            sequences = []
-            for j in range(max_seqs_per_problem):
-                token_ids = [random.randint(1, 5000) for _ in range(50)]
-                sequences.append(token_ids)
-            problems_data.append((problem_id, prompt_tokens, sequences))
+            problems_data.append({
+                "problem_id": problem_id,
+                "sequences": [
+                    {
+                        "seq_id": -j - 1,
+                        "prompt_tokens": prompt_tokens,
+                        "response_tokens": [random.randint(1, 5000) for _ in range(50)],
+                    }
+                    for j in range(max_seqs_per_problem)
+                ],
+            })
         
         return problems_data
     
-    def test_serial_execution(self, problems_data: List[Tuple[str, List[int], List[List[int]]]]) -> Dict[str, Any]:
+    def test_serial_execution(self, problems_data: List[Dict]) -> Dict[str, Any]:
         """测试串行执行"""
         print("\n🔵 测试传统串行模式")
         
-        cache = SuffixCache(max_depth=64, thread_safe=False)
+        from arctic_inference.suffix_decoding._C import SuffixTree
+        cache = SuffixDecodingCache(max_tree_depth=64, thread_safe=False)
         start_time = time.perf_counter()
         
         processed_count = 0
         total_operations = 0
         
-        for problem_id, prompt_tokens, sequences in problems_data:
-            for i, token_ids in enumerate(sequences):
-                seq_id = -i-1  # 使用负数seq_id
-                cache.prebuild_problemtree(seq_id, problem_id, prompt_tokens, token_ids)
-                total_operations += 2  # prompt + response
+        for item in problems_data:
+            problem_id = str(item["problem_id"])
+            for seq_data in item["sequences"]:
+                seq_id = seq_data["seq_id"]
+                prompt_tokens = seq_data.get("prompt_tokens", [])
+                response_tokens = seq_data.get("response_tokens", [])
+                if problem_id not in cache._problem_tree:
+                    cache._problem_tree[problem_id] = SuffixTree(cache._max_tree_depth)
+                tree = cache._problem_tree[problem_id]
+                if prompt_tokens:
+                    tree.extend(seq_id, prompt_tokens)
+                if response_tokens:
+                    tree.extend(seq_id, response_tokens)
+                total_operations += 2
             processed_count += 1
         
         total_time = time.perf_counter() - start_time
@@ -125,7 +144,7 @@ class TestSuffixCacheParallel:
             "processed_problems": processed_count,
             "total_operations": total_operations,
             "problem_tree_count": stats["problem_tree_count"],
-            "total_sequences": stats["total_sequences"],
+            "total_sequences": stats["total_sequences_in_problem_trees"],
             "thread_safe": False
         }
         
@@ -133,53 +152,49 @@ class TestSuffixCacheParallel:
         print(f"  处理问题: {processed_count}")
         print(f"  总操作数: {total_operations}")
         print(f"  问题树数: {stats['problem_tree_count']}")
-        print(f"  总序列数: {stats['total_sequences']}")
+        print(f"  总序列数: {stats['total_sequences_in_problem_trees']}")
         
         return result, cache
     
-    def test_parallel_execution(self, problems_data: List[Tuple[str, List[int], List[List[int]]]]) -> Dict[str, Any]:
+    def test_parallel_execution(self, problems_data: List[Dict]) -> Dict[str, Any]:
         """测试C++对象级锁定并行执行"""
         print(f"\n🟢 测试C++对象级锁定并行模式")
         
-        cache = SuffixCache(max_depth=64, thread_safe=True, max_threads=4)
+        cache = SuffixDecodingCache(max_tree_depth=64, thread_safe=True, max_threads=4)
         
-        # 使用新的批量并行方法
         result = cache.prebuild_problems_parallel(problems_data)
         stats = cache.get_cache_stats()
         
-        # 补充统计信息
         result.update({
             "problem_tree_count": stats["problem_tree_count"],
-            "total_sequences": stats["total_sequences"],
+            "total_sequences": stats["total_sequences_in_problem_trees"],
         })
         
         return result, cache
     
-    def verify_consistency(self, serial_cache: SuffixCache, parallel_cache: SuffixCache, 
-                         problems_data: List[Tuple[str, List[int], List[List[int]]]]) -> bool:
+    def verify_consistency(self, serial_cache: SuffixDecodingCache, parallel_cache: SuffixDecodingCache, 
+                         problems_data: List[Dict]) -> bool:
         """验证串行和并行执行结果的一致性"""
         print(f"\n🔍 验证结果一致性")
         
         inconsistencies = []
         
-        # 比较基本统计
         serial_stats = serial_cache.get_cache_stats()
         parallel_stats = parallel_cache.get_cache_stats()
         
         if serial_stats["problem_tree_count"] != parallel_stats["problem_tree_count"]:
             inconsistencies.append(f"问题树数不一致: {serial_stats['problem_tree_count']} vs {parallel_stats['problem_tree_count']}")
         
-        if serial_stats["total_sequences"] != parallel_stats["total_sequences"]:
-            inconsistencies.append(f"总序列数不一致: {serial_stats['total_sequences']} vs {parallel_stats['total_sequences']}")
+        if serial_stats["total_sequences_in_problem_trees"] != parallel_stats["total_sequences_in_problem_trees"]:
+            inconsistencies.append(f"总序列数不一致: {serial_stats['total_sequences_in_problem_trees']} vs {parallel_stats['total_sequences_in_problem_trees']}")
         
-        # 比较每个问题的树结构
-        for problem_id, _, _ in problems_data:
+        for item in problems_data:
+            problem_id = str(item["problem_id"])
             if problem_id in serial_cache._problem_tree and problem_id in parallel_cache._problem_tree:
                 serial_tree = serial_cache._problem_tree[problem_id]
                 parallel_tree = parallel_cache._problem_tree[problem_id]
                 
                 try:
-                    # 比较序列数量
                     serial_seqs = serial_tree.num_seqs()
                     parallel_seqs = parallel_tree.num_seqs_safe() if hasattr(parallel_tree, 'num_seqs_safe') else parallel_tree.num_seqs()
                     
@@ -202,9 +217,9 @@ class TestSuffixCacheParallel:
         """测试线程安全性 - 并发访问同一问题ID"""
         print(f"\n🔐 测试线程安全性")
         
-        cache = SuffixCache(max_depth=64, thread_safe=True, max_threads=8)
+        from arctic_inference.suffix_decoding._C import SuffixTree
+        cache = SuffixDecodingCache(max_tree_depth=64, thread_safe=True, max_threads=8)
         
-        # 创建多个线程同时操作同一个problem_id
         test_problem_id = "thread_safety_test"
         test_prompt = [1, 2, 3, 4, 5]
         
@@ -212,18 +227,19 @@ class TestSuffixCacheParallel:
             """并发操作函数"""
             for i in range(20):
                 test_tokens = [thread_id * 1000 + i + j for j in range(10)]
-                cache.prebuild_problemtree(-thread_id-i, test_problem_id, test_prompt, test_tokens)
+                if test_problem_id not in cache._problem_tree:
+                    cache._problem_tree[test_problem_id] = SuffixTree(cache._max_tree_depth)
+                tree = cache._problem_tree[test_problem_id]
+                tree.extend_safe(-thread_id * 100 - i, test_prompt + test_tokens)
             return thread_id
         
-        # 启动多线程并发操作
         with ThreadPoolExecutor(max_workers=8) as executor:
             futures = [executor.submit(concurrent_operation, i) for i in range(8)]
             results = [f.result() for f in futures]
         
-        # 检查结果
         tree = cache._problem_tree[test_problem_id]
         final_seqs = tree.num_seqs_safe() if hasattr(tree, 'num_seqs_safe') else tree.num_seqs()
-        expected_seqs = 8 * 20  # 8线程 x 20操作
+        expected_seqs = 8 * 20
         
         success = final_seqs == expected_seqs
         
