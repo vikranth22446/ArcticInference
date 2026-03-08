@@ -1259,24 +1259,30 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     ) -> list[list[int]]:
         config = self.speculative_config
 
-        # Get hard/medium/easy indices
-        hard_indices, medium_indices, easy_indices, allowed_indices = (
+        # DAS tier parameters from config (hard→long, medium→medium, easy→short)
+        tier_spec_tokens = {
+            "long": config.das_spec_tokens_long,
+            "medium": config.das_spec_tokens_medium,
+            "short": config.das_spec_tokens_short,
+        }
+        tier_spec_factors = {
+            "long": config.das_spec_factor_long,
+            "medium": config.das_spec_factor_medium,
+            "short": config.das_spec_factor_short,
+        }
+        online_long_thr = config.das_online_long_threshold
+        online_medium_thr = config.das_online_medium_threshold
+
+        hard_indices, medium_indices, easy_indices, _ = (
             self._get_hard_and_non_hard_indices()
         )
-
-        # Define spec parameters based on problem difficulty and batch size
-        hard_spec, hard_prob, hard_spec_factor = 16, 0.1, 2
-        medium_spec, medium_prob, medium_spec_factor = 8, 0.1, 1
-        current_spec_tokens = medium_spec  # default
-        current_min_prob = config.suffix_min_token_prob  # default
-        current_spec_factor = config.suffix_max_spec_factor  # default
+        hard_set = set(hard_indices)
+        medium_set = set(medium_indices)
 
         results = []
         for i, sampled_ids in enumerate(sampled_token_ids):
             spec_ids = spec_token_ids[i] if spec_token_ids is not None else []
-            num_sampled_ids = len(sampled_ids)
-            if not num_sampled_ids:
-                # Skip speculative decoding.
+            if not len(sampled_ids):
                 results.append(SuffixDecodingDraft())
                 continue
 
@@ -1295,35 +1301,28 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 results.append(SuffixDecodingDraft())
                 continue
 
-            # if i in hard_indices:
-            #     current_spec_tokens = hard_spec
-            #     current_min_prob = hard_prob
-            #     current_spec_factor = hard_spec_factor
-            # elif i in medium_indices:
-            #     current_spec_tokens = medium_spec
-            #     current_min_prob = medium_prob
-            #     current_spec_factor = medium_spec_factor
-            # elif end_idx < 4000:
-            #     results.append(SuffixDecodingDraft())
-            #     continue
-            # if end_idx > 4000 and end_idx < 8000 and i in easy_indices:
-            #     current_spec_tokens, current_min_prob, current_spec_factor = (
-            #         medium_spec,
-            #         medium_prob,
-            #         medium_spec_factor,
-            #     )
-            # if end_idx > 8000 and i not in hard_indices:
-            #     current_spec_tokens, current_min_prob, current_spec_factor = (
-            #         hard_spec,
-            #         hard_prob,
-            #         hard_spec_factor,
-            #     )
-        
-            current_spec_tokens, current_min_prob, current_spec_factor = (
-                    hard_spec,
-                    hard_prob,
-                    hard_spec_factor,
-                )
+            # Determine tier from classification (hard→long, medium→medium, easy→short)
+            if i in hard_set:
+                tier = "long"
+            elif i in medium_set:
+                tier = "medium"
+            else:
+                tier = "short"
+
+            # Online reclassification: promote tier when token count exceeds thresholds
+            if online_long_thr > 0 and end_idx > online_long_thr and tier != "long":
+                tier = "long"
+            elif online_medium_thr > 0 and end_idx > online_medium_thr and tier == "short":
+                tier = "long"
+
+            current_spec_tokens = tier_spec_tokens[tier]
+            current_spec_factor = tier_spec_factors[tier]
+            current_min_prob = config.suffix_min_token_prob
+
+            if current_spec_tokens <= 0:
+                results.append(SuffixDecodingDraft())
+                continue
+
             max_spec_tokens = min(
                 MAX_SPEC_LEN - len(spec_ids),
                 config.suffix_cache_max_depth,

@@ -67,6 +67,23 @@ class ArcticSpeculativeConfig(SpeculativeConfig):
     # the same logical suffix tree content.
     suffix_cache_bootstrap: Optional[List[Sequence[int]]] = None
 
+    # DAS (Difficulty-Aware Speculation) parameters.
+    # Per-tier max speculative tokens (hard→long, medium→medium, easy→short).
+    das_spec_tokens_short: int = 0
+    das_spec_tokens_medium: int = 2
+    das_spec_tokens_long: int = 4
+    # Per-tier speculation tree branching factor.
+    das_spec_factor_short: float = 1.0
+    das_spec_factor_medium: float = 1.0
+    das_spec_factor_long: float = 2.0
+    # Ratios for initial problem classification (used by the trainer).
+    das_long_ratio: float = 0.2
+    das_medium_ratio: float = 0.4
+    # Online reclassification thresholds (token count including prompt).
+    # When a request's total token count exceeds these, its tier is promoted.
+    das_online_long_threshold: int = 5000
+    das_online_medium_threshold: int = 3000
+
 
 class ParallelConfigPatch(ArcticPatch[ParallelConfig]):
 
