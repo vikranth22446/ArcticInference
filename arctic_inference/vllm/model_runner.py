@@ -28,7 +28,6 @@ from itertools import tee
 from datetime import datetime
 import os
 import json
-import re
 import numpy as np
 import torch
 from transformers import AutoTokenizer
@@ -61,6 +60,7 @@ from arctic_inference.suffix_decoding import SuffixDecodingCache, SuffixDecoding
 from arctic_inference.patching import ArcticPatch
 from arctic_inference.vllm.context_managers import ProblemIdContextManager
 from arctic_inference.vllm.spec_dec.arctic_proposer import ArcticProposer
+from arctic_inference.vllm.suffix_cache_manager import SuffixCacheWorkerManager
 
 SP_TP_MODE = None
 # Configuration for hard problems only suffix decoding
@@ -156,272 +156,6 @@ def is_shift_parallel_mode() -> bool:
     return SP_TP_MODE is True
 
 
-def extract_problem_id_from_prompt(prompt) -> Optional[str]:
-    """Extract problem_id from a prompt object.
-    
-    This function should be customized based on how problem_id is embedded in prompts.
-    Current implementation supports vLLMRollout's prompt format.
-    """
-    try:
-        # Method 1: Direct problem_id field in dict (vLLMRollout format)
-        if isinstance(prompt, dict) and 'problem_id' in prompt:
-            return prompt['problem_id']
-        
-        # Method 2: If prompt is a dict with prompt_token_ids and problem_id fields
-        if isinstance(prompt, dict):
-            # Check for vLLM input format: {"prompt_token_ids": [...], "problem_id": "..."}
-            if 'problem_id' in prompt:
-                return prompt['problem_id']
-            
-            # Check for meta field containing problem_id
-            if 'meta' in prompt:
-                meta = prompt['meta']
-                if isinstance(meta, dict) and 'problem_id' in meta:
-                    return meta['problem_id']
-        
-        # Method 3: If prompt string contains problem_id pattern
-        if isinstance(prompt, str):
-            import re
-            # Pattern: problem_id:value
-            match = re.search(r'problem_id:(\w+)', prompt)
-            if match:
-                return match.group(1)
-            
-            # Pattern: [PROBLEM_ID: value]
-            match = re.search(r'\[PROBLEM_ID:\s*(\w+)\]', prompt)
-            if match:
-                return match.group(1)
-        
-        # Method 4: Handle TextPrompt or other prompt types
-        if hasattr(prompt, 'problem_id'):
-            return prompt.problem_id
-        
-        # Method 5: Handle nested structures
-        if hasattr(prompt, 'get'):
-            return prompt.get('problem_id')
-            
-        return None
-    except Exception:
-        return None
-
-
-
-
-
-class SuffixCacheWorkerManager:
-    def __init__(self, max_workers=8):
-        self._current_cache = None
-        self._current_generation_id = -1
-        self._prebuilt_caches = {}
-        self._stale_caches = []
-        self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="SuffixCache")
-        self._lock = threading.Lock()
-        self._build_futures = {}
-        
-    def get_current_cache(self):
-        with self._lock:
-            return self._current_cache
-    
-    def get_current_generation_id(self):
-        with self._lock:
-            return self._current_generation_id
-            
-    def rebuild_cache_sync(self, generation_id, cache_params, problems_data):
-        if generation_id <= self._current_generation_id:
-            return False
-            
-        new_cache = SuffixDecodingCache(**cache_params)
-        if problems_data:
-            new_cache.prebuild_problems_parallel(problems_data)
-        
-        with self._lock:
-            old_cache = self._current_cache
-            self._current_cache = new_cache
-            self._current_generation_id = generation_id
-            
-            if old_cache:
-                self._executor.submit(old_cache.clear_all_cache)
-        return True
-
-    def prebuild_cache_async(self, generation_id, cache_params, problems_data):
-        if generation_id in self._build_futures:
-            old_future = self._build_futures.pop(generation_id)
-            old_future.cancel()
-        enqueue_ts = time.perf_counter()
-
-        def _load_problem_data_from_file_refs(payload):
-            """
-            Build problems_data from lightweight file references.
-
-            Payload format:
-                {
-                    "mode": "file_ref_v1",
-                    "token_ids_dir": "<...>/generation_token_ids",
-                    "steps_needed_by_pid": {"pid": [step1, step2, ...], ...}
-                }
-            Returns:
-                List[dict] in canonical format for prebuild_problems_parallel.
-            """
-            mode = payload.get("mode")
-            if mode != "file_ref_v1":
-                return payload
-
-            token_ids_dir = payload.get("token_ids_dir")
-            steps_needed_by_pid = payload.get("steps_needed_by_pid", {})
-            if not token_ids_dir or not isinstance(steps_needed_by_pid, dict):
-                print(
-                    f"[SUFFIX_CACHE] Invalid file_ref payload for generation_id={generation_id}: "
-                    f"token_ids_dir={token_ids_dir}, steps_needed_by_pid_type={type(steps_needed_by_pid)}",
-                    flush=True,
-                )
-                return []
-
-            if not os.path.isdir(token_ids_dir):
-                print(
-                    f"[SUFFIX_CACHE] token_ids_dir does not exist for generation_id={generation_id}: {token_ids_dir}",
-                    flush=True,
-                )
-                return []
-
-            normalized_steps_by_pid: dict[str, set[int]] = {}
-            for pid, steps in steps_needed_by_pid.items():
-                pid_str = str(pid)
-                if not isinstance(steps, list):
-                    continue
-                normalized_steps = set()
-                for s in steps:
-                    if not isinstance(s, (int, str)):
-                        continue
-                    try:
-                        normalized_steps.add(int(s))
-                    except (TypeError, ValueError):
-                        continue
-                normalized_steps_by_pid[pid_str] = normalized_steps
-
-            if not normalized_steps_by_pid:
-                return []
-
-            step_to_pids: dict[int, set[str]] = {}
-            for pid, steps in normalized_steps_by_pid.items():
-                for step in steps:
-                    step_to_pids.setdefault(step, set()).add(pid)
-
-            all_steps = sorted(step_to_pids.keys())
-            pid_to_sequences: dict[str, list[list[int]]] = {
-                pid: [] for pid in normalized_steps_by_pid
-            }
-
-            io_start = time.perf_counter()
-            for step in all_steps:
-                file_path = os.path.join(token_ids_dir, f"{step}.jsonl")
-                if not os.path.exists(file_path):
-                    continue
-                required_pids = step_to_pids[step]
-                with open(file_path, "r") as f:
-                    for line in f:
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            entry = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        entry_pid = str(entry.get("problem_id", ""))
-                        if entry_pid not in required_pids:
-                            continue
-                        response_ids = entry.get("response_token_ids")
-                        if isinstance(response_ids, list) and response_ids:
-                            pid_to_sequences[entry_pid].append(response_ids)
-
-            io_end = time.perf_counter()
-            problems_data_from_files = []
-            total_seqs = 0
-            for pid, seqs in pid_to_sequences.items():
-                if seqs:
-                    problems_data_from_files.append({
-                        "problem_id": pid,
-                        "sequences": [
-                            {"seq_id": -i - 1, "prompt_tokens": [], "response_tokens": s}
-                            for i, s in enumerate(seqs)
-                        ],
-                    })
-                    total_seqs += len(seqs)
-            print(
-                f"[PREBUILD_TIMING] generation_id={generation_id} worker_file_ref_load_s="
-                f"{(io_end - io_start):.3f} problems={len(problems_data_from_files)} sequences={total_seqs} "
-                f"steps={len(all_steps)}",
-                flush=True,
-            )
-            return problems_data_from_files
-        
-        def _build():
-            build_start_ts = time.perf_counter()
-            queue_wait_s = build_start_ts - enqueue_ts
-            print(
-                f"[PREBUILD_TIMING] generation_id={generation_id} worker_build_queue_wait_s={queue_wait_s:.3f}",
-                flush=True,
-            )
-            try:
-                cache = SuffixDecodingCache(**cache_params)
-                resolved_problem_data = _load_problem_data_from_file_refs(problems_data) \
-                    if isinstance(problems_data, dict) else problems_data
-                if resolved_problem_data:
-                    cache.prebuild_problems_parallel(resolved_problem_data)
-                
-                with self._lock:
-                    self._prebuilt_caches[generation_id] = cache
-                build_end_ts = time.perf_counter()
-                print(
-                    f"[PREBUILD_TIMING] generation_id={generation_id} worker_build_total_s="
-                    f"{(build_end_ts - build_start_ts):.3f}",
-                    flush=True,
-                )
-                return cache
-            except Exception as e:
-                logger.error(f"Failed to prebuild cache for generation {generation_id}: {e}")
-                return None
-            finally:
-                # Only remove if this is still the current future
-                current_future = self._build_futures.get(generation_id)
-                if current_future is future:
-                    self._build_futures.pop(generation_id, None)
-        
-        future = self._executor.submit(_build)
-        self._build_futures[generation_id] = future
-        return future
-    
-    def activate_prebuilt_cache(self, generation_id):
-        with self._lock:
-            if generation_id in self._prebuilt_caches:
-                old_cache = self._current_cache
-                self._current_cache = self._prebuilt_caches.pop(generation_id)
-                self._current_generation_id = generation_id
-                if old_cache:
-                    self._stale_caches.append(old_cache)
-                return True
-        return False
-
-    def clear_old_suffix_cache(self, generation_id):
-        """Clean up stale caches (from activation) and any leftover prebuilt caches in background."""
-        with self._lock:
-            stale_prebuilt_ids = [gid for gid in self._prebuilt_caches if gid < generation_id]
-            caches_to_clear = [self._prebuilt_caches.pop(gid) for gid in stale_prebuilt_ids]
-            caches_to_clear.extend(self._stale_caches)
-            self._stale_caches.clear()
-        for cache in caches_to_clear:
-            self._executor.submit(cache.clear_all_cache)
-    
-    def shutdown(self):
-        for future in self._build_futures.values():
-            future.cancel()
-        self._executor.shutdown(wait=True)
-        
-        with self._lock:
-            if self._current_cache:
-                self._current_cache.clear_all_cache()
-            for cache in self._prebuilt_caches.values():
-                cache.clear_all_cache()
-            self._prebuilt_caches.clear()
 
 
 class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
@@ -498,19 +232,27 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         self._timing_flush_every_s: float = float(_os.getenv("ARCTIC_TIMING_FLUSH_SEC", "5"))
         self._timing_last_flush_time: float = _time.monotonic()
 
+        # Cache process identity (immutable after fork) to avoid repeated getenv
+        self._rank = int(_os.getenv("RANK", "0"))
+        self._local_rank = int(_os.getenv("LOCAL_RANK", "0"))
+        self._world_size = int(_os.getenv("WORLD_SIZE", "1"))
+        self._process_info = {
+            "rank": self._rank,
+            "local_rank": self._local_rank,
+            "world_size": self._world_size,
+        }
+
         # Precompute output path for this process
         output_dir = _os.getenv("ARCTIC_METRICS_DIR", "/tmp/arctic_metrics")
         _os.makedirs(output_dir, exist_ok=True)
-        local_rank = _os.getenv("LOCAL_RANK", "0")
-        rank = _os.getenv("RANK", "0")
         self.cpu_timing_file_path = _os.path.join(
-            output_dir, f"execution_timing_rank_{rank}_local_{local_rank}_cpu.jsonl"
+            output_dir, f"execution_timing_rank_{self._rank}_local_{self._local_rank}_cpu.jsonl"
         )
         self.gpu_timing_file_path = _os.path.join(
-            output_dir, f"execution_timing_rank_{rank}_local_{local_rank}_gpu.jsonl"
+            output_dir, f"execution_timing_rank_{self._rank}_local_{self._local_rank}_gpu.jsonl"
         )
         self.suffix_stats_file_path = _os.path.join(
-            output_dir, f"suffix_tree_stats_rank_{rank}_local_{local_rank}.jsonl"
+            output_dir, f"suffix_tree_stats_rank_{self._rank}_local_{self._local_rank}.jsonl"
         )
         # Ensure buffers flush on process exit
         _atexit.register(lambda: self._flush_timing_buffer(force=True))
@@ -595,45 +337,22 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
     ) -> Union[ModelRunnerOutput, IntermediateTensors]:
     
 
-        # # Get process information for data parallel scenarios
-        # local_rank = os.getenv("LOCAL_RANK", "0")
-        # world_size = os.getenv("WORLD_SIZE", "1")
-        # rank = os.getenv("RANK", "0")
-                    # ### Record GPU execution start time for monitoring
         torch.cuda.synchronize()
         execution_start_time = time.perf_counter()
         execution_start_timestamp = datetime.now().isoformat()
             
         self._update_states(scheduler_output)
-        # Extract problem_ids for the current batch at the very beginning
         # Build req_id to problem_id mapping for the current batch
-        self._current_batch_req_id_to_problem_id = {}
-        self._current_batch_problem_ids = []
-        
         if hasattr(self.input_batch, 'req_ids') and self.input_batch.req_ids:
             batch_size = len(self.input_batch.req_ids)
-            
-            # Build mapping from req_id to problem_id
-            # Get req_id to problem_id mapping from LLM patches (most reliable)
             context_mapping = ProblemIdContextManager.get_req_id_to_problem_id_mapping()
-            #print(f"DEBUG: context_mapping: {context_mapping}")
-            
-            for i, req_id in enumerate(self.input_batch.req_ids):
-                problem_id = None
-                
-                # Method 1: Use mapping from LLM patches (most reliable)
-                if req_id in context_mapping:
-                    problem_id = context_mapping[req_id]
-                
-                # Method 2: Fallback to context manager index lookup
-                if problem_id is None:
-                    print(f"DEBUG: problem_id is None for req_id {req_id}")
-                
-                self._current_batch_req_id_to_problem_id[req_id] = problem_id
-                self._current_batch_problem_ids.append(problem_id)
-                
+            self._current_batch_req_id_to_problem_id = {
+                req_id: context_mapping.get(req_id)
+                for req_id in self.input_batch.req_ids
+            }
         else:
             batch_size = 0
+            self._current_batch_req_id_to_problem_id = {}
 
         
         if not scheduler_output.total_num_scheduled_tokens:
@@ -645,7 +364,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         (attn_metadata, attention_cuda_graphs, logits_indices,
          spec_decode_metadata,
          num_scheduled_tokens_np) = (self._prepare_inputs(scheduler_output))
-        batch_size = len(self.input_batch.req_ids) if hasattr(self, 'input_batch') and self.input_batch else 0
 
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         use_shift_model = (
@@ -974,81 +692,6 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             num_nans_in_logits=num_nans_in_logits,
         )
 
-    def _get_problem_id_for_index(self, index: int) -> Optional[str]:
-        """Retrieve problem_id for the i-th request if available.
-
-        Sources:
-        - `self.input_batch.problem_id` propagated from rollout layer
-        - Per-request state containers
-        - Fallback: regex extract like "prob_0001" from request id
-        """
-        req_id = None
-        try:
-            req_id = self.input_batch.req_ids[index]
-        except Exception:
-            pass
-
-        # First try context manager (highest priority)
-        try:
-            problem_id = ProblemIdContextManager.get_problem_id_for_index(index)
-            if problem_id is not None:
-                return problem_id
-        except Exception:
-            pass
-
-        # Try input_batch vectorized field first
-        try:
-            problem_ids = getattr(self.input_batch, "problem_id", None)
-            if problem_ids is not None:
-                pid = problem_ids[index]
-                if isinstance(pid, bytes):
-                    pid = pid.decode()
-                # numpy scalar -> python scalar
-                if hasattr(pid, "item"):
-                    pid = pid.item()
-                if isinstance(pid, (list, np.ndarray)):
-                    pid = pid[0] if len(pid) > 0 else None
-                if isinstance(pid, str):
-                    return pid
-        except Exception:
-            pass
-
-        # Try request state attributes
-        try:
-            if req_id is not None and req_id in self.requests:
-                req_state = self.requests[req_id]
-                pid = getattr(req_state, "problem_id", None)
-                if isinstance(pid, bytes):
-                    pid = pid.decode()
-                if isinstance(pid, str):
-                    return pid
-                for container_name in ("inputs", "input", "meta", "meta_info", "request_kwargs", "extra", "extras"):
-                    container = getattr(req_state, container_name, None)
-                    if isinstance(container, dict) and "problem_id" in container:
-                        pid = container.get("problem_id")
-                        if isinstance(pid, bytes):
-                            pid = pid.decode()
-                        if isinstance(pid, str):
-                            return pid
-        except Exception:
-            pass
-
-        # Fallback: extract a common pattern from req_id
-        if req_id is not None:
-            m = re.search(r"(prob_[0-9]{4,})", str(req_id))
-            if m:
-                return m.group(1)
-        return None
-
-    def get_current_batch_problem_ids(self) -> list[Optional[str]]:
-        """
-        Get problem_ids for the current batch that were extracted at the beginning of execute_model.
-        
-        Returns:
-            List of problem_ids for the current batch, with None for requests without problem_ids.
-        """
-        return getattr(self, '_current_batch_problem_ids', [])
-    
     def get_problem_id_by_request_id(self, req_id: str) -> Optional[str]:
         """
         Get problem_id for a specific request ID.
@@ -1059,54 +702,43 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         Returns:
             The problem_id if found, None otherwise
         """
-        # Method 1: Use current batch mapping (most efficient and reliable)
         if hasattr(self, '_current_batch_req_id_to_problem_id'):
-            problem_id = self._current_batch_req_id_to_problem_id.get(req_id)
-            if problem_id is not None:
-                return problem_id
-        print(f"Failed to get problem_id for request {req_id}")
+            return self._current_batch_req_id_to_problem_id.get(req_id)
         return None
 
     def _get_hard_and_non_hard_indices(
         self, top_percent: float = 0.3
     ) -> tuple[list[int], list[int], list[int], list[int]]:
-        """
-        计算当前 batch 中的 hard 和 medium 请求索引。
+        """Classify current batch requests into hard/medium/easy index lists.
 
-        基于 ProblemIdContextManager.get_hard_medium_ids() 提供的 problem_id 列表，
-        将属于 hard_ids 的请求划为 hard，将属于 medium_ids 的请求划为 non-hard（此处表示 medium）。
-        其他未列入者不分配配额。
+        Uses the req_id→problem_id mapping built at the start of execute_model
+        and the process-level difficulty IDs from ProblemIdContextManager.
+        Difficulty sets are cached and only rebuilt when the version changes
+        (i.e. when set_hard_medium_ids is called between training steps).
         """
-        if ProblemIdContextManager.has_hard_medium_indices():
-            cached_hard, cached_medium, cached_easy, cached_allowed_indices = (
-                ProblemIdContextManager.get_hard_medium_indices()
-            )
-            return cached_hard, cached_medium, cached_easy, cached_allowed_indices
-        else:
-            hard_indices: list[int] = []
-            medium_indices: list[int] = []
-            easy_indices: list[int] = []
+        cur_ver = ProblemIdContextManager.get_difficulty_version()
+        if getattr(self, '_difficulty_cache_ver', -1) != cur_ver:
             hard_ids, medium_ids, easy_ids = ProblemIdContextManager.get_hard_medium_ids()
-            hard_set = set(str(pid) for pid in (hard_ids or []))
-            medium_set = set(str(pid) for pid in (medium_ids or []))
-            easy_set = set(str(pid) for pid in (easy_ids or []))
-            for i, req_id in enumerate(self.input_batch.req_ids):
-                problem_id = ProblemIdContextManager.get_problem_id_for_req_id(req_id)
-                if problem_id is None:
-                    problem_id = self.get_problem_id_by_request_id(req_id)
-                pid_str = str(problem_id) if problem_id else ""
-                if pid_str in hard_set:
-                    hard_indices.append(i)
-                elif pid_str in medium_set:
-                    medium_indices.append(i)
-                elif pid_str in easy_set:
-                    easy_indices.append(i)
+            self._cached_hard_set: frozenset[str] = frozenset(str(pid) for pid in (hard_ids or []))
+            self._cached_medium_set: frozenset[str] = frozenset(str(pid) for pid in (medium_ids or []))
+            self._cached_easy_set: frozenset[str] = frozenset(str(pid) for pid in (easy_ids or []))
+            self._difficulty_cache_ver = cur_ver
 
-            allowed_indices = hard_indices + medium_indices + easy_indices
-            ProblemIdContextManager.set_hard_medium_indices(
-                hard_indices, medium_indices, easy_indices, allowed_indices
-            )
+        hard_indices: list[int] = []
+        medium_indices: list[int] = []
+        easy_indices: list[int] = []
+        req_id_to_pid = getattr(self, '_current_batch_req_id_to_problem_id', {})
+        for i, req_id in enumerate(self.input_batch.req_ids):
+            pid = req_id_to_pid.get(req_id)
+            pid_str = str(pid) if pid else ""
+            if pid_str in self._cached_hard_set:
+                hard_indices.append(i)
+            elif pid_str in self._cached_medium_set:
+                medium_indices.append(i)
+            elif pid_str in self._cached_easy_set:
+                easy_indices.append(i)
 
+        allowed_indices = hard_indices + medium_indices + easy_indices
         return hard_indices, medium_indices, easy_indices, allowed_indices
 
     def propose_draft_token_ids(
@@ -1230,18 +862,12 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         return draft_token_ids
 
     def _update_suffix_cache(self, sampled_token_ids: list[list[int]]) -> None:
-        seen_req_ids = set()
-        seen_problem_ids = set()
         for i, sampled_ids in enumerate(sampled_token_ids):
-            req_id = self.input_batch.req_ids[i]
-            problem_id = self.get_problem_id_by_request_id(req_id)
-            seen_req_ids.add(req_id)
-            seen_problem_ids.add(problem_id)
-
             if not sampled_ids:
                 continue
 
-            
+            req_id = self.input_batch.req_ids[i]
+            problem_id = self.get_problem_id_by_request_id(req_id)
             index = self.input_batch.req_id_to_index[req_id]
             if not self._suffix_cache.has_cached_prompt(req_id):
                 num_prompt_tokens = self.input_batch.num_prompt_tokens[index]
@@ -1363,7 +989,14 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
         return changed
 
     def prebuild_cache_async(self, generation_id, cache_params, problems_data):
-        return self._suffix_cache_manager.prebuild_cache_async(generation_id, cache_params, problems_data)
+        spec_cfg = getattr(self, "speculative_config", None)
+        das_long_ratio = getattr(spec_cfg, "das_long_ratio", 0.2) if spec_cfg else 0.2
+        das_medium_ratio = getattr(spec_cfg, "das_medium_ratio", 0.4) if spec_cfg else 0.4
+        return self._suffix_cache_manager.prebuild_cache_async(
+            generation_id, cache_params, problems_data,
+            das_long_ratio=das_long_ratio,
+            das_medium_ratio=das_medium_ratio,
+        )
 
     def activate_prebuilt_cache(self, generation_id):
         mgr = self._suffix_cache_manager
@@ -1606,11 +1239,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 "num_scheduled_tokens": num_scheduled_tokens,
                 "problem_ids": problem_ids,
                 "context_lens": context_lens,
-                "process_info": {
-                    "rank": int(os.getenv("RANK", "0")),
-                    "local_rank": int(os.getenv("LOCAL_RANK", "0")),
-                    "world_size": int(os.getenv("WORLD_SIZE", "1"))
-                },
+                "process_info": self._process_info,
                 "early_return": early_return,
             }
             
@@ -1698,11 +1327,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                 "speculative_method": getattr(self.speculative_config, 'method', None) if hasattr(self, 'speculative_config') and self.speculative_config else None,
                 "suffix_decoding_enabled": getattr(self.speculative_config, 'enable_suffix_decoding', False) if hasattr(self, 'speculative_config') and self.speculative_config else False,
                 "suffix_cache_exists": self._suffix_cache is not None if hasattr(self, '_suffix_cache') else False,
-                "process_info": {
-                    "rank": int(os.getenv("RANK", "0")),
-                    "local_rank": int(os.getenv("LOCAL_RANK", "0")),
-                    "world_size": int(os.getenv("WORLD_SIZE", "1"))
-                }
+                "process_info": self._process_info,
             }
             
             # Write to file
@@ -1749,11 +1374,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             "speculative_method": getattr(self.speculative_config, 'method', None) if hasattr(self, 'speculative_config') and self.speculative_config else None,
             "suffix_decoding_enabled": getattr(self.speculative_config, 'enable_suffix_decoding', False) if hasattr(self, 'speculative_config') and self.speculative_config else False,
             "suffix_cache_exists": self._suffix_cache is not None if hasattr(self, '_suffix_cache') else False,
-            "process_info": {
-                "rank": int(os.getenv("RANK", "0")),
-                "local_rank": int(os.getenv("LOCAL_RANK", "0")),
-                "world_size": int(os.getenv("WORLD_SIZE", "1"))
-            }
+            "process_info": self._process_info,
         }
         
         # Write to file
@@ -1790,12 +1411,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
             output_dir = os.getenv("ARCTIC_METRICS_DIR", "artic_metrics_data/")
             os.makedirs(output_dir, exist_ok=True)
             
-            # Get process info for filename
-            local_rank = os.getenv("LOCAL_RANK", "0")
-            rank = os.getenv("RANK", "0")
-            
-            # Create separate files for each process to avoid conflicts
-            token_file = os.path.join(output_dir, f"token_data_rank_{rank}_local_{local_rank}.jsonl")
+            token_file = os.path.join(output_dir, f"token_data_rank_{self._rank}_local_{self._local_rank}.jsonl")
             
             # Write with immediate flush to ensure data is written atomically
             with open(token_file, "a") as f:
@@ -1877,11 +1493,7 @@ class GPUModelRunnerPatch(ArcticPatch[GPUModelRunner]):
                     "valid_sampled_text": valid_text,
                     "pre_draft_16_tokens": pre_draft_tokens,
                     "pre_draft_16_text": pre_draft_text,
-                    "process_info": {
-                        "rank": int(os.getenv("RANK", "0")),
-                        "local_rank": int(os.getenv("LOCAL_RANK", "0")),
-                        "world_size": int(os.getenv("WORLD_SIZE", "1"))
-                    }
+                    "process_info": self._process_info,
                 }
                 
                 token_data_entries.append(token_entry)

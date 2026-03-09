@@ -11,9 +11,21 @@ import contextlib
 import threading
 from typing import List, Optional
 
-# Thread-local storage for problem_ids context and global lock for atomic operations
+# Thread-local storage for per-batch / per-request data (batch problem_ids,
+# req_id mapping).
 _problem_id_context = threading.local()
-_problem_id_context_lock = threading.Lock()
+
+# Process-level (cross-thread) storage for difficulty classification
+# (hard/medium/easy IDs).  These are set from a background prebuild thread
+# and read from the main worker thread during execute_model(), so they MUST
+# NOT live in threading.local().
+_difficulty_lock = threading.Lock()
+_difficulty_data: dict = {
+    'hard_ids': None,
+    'medium_ids': None,
+    'easy_ids': None,
+    'version': 0,
+}
 
 
 class ProblemIdContextManager:
@@ -58,14 +70,12 @@ class ProblemIdContextManager:
 
     @staticmethod
     def atomic_update_req_id_mapping(req_id: str, problem_id: Optional[str]):
-        """Atomically update req_id to problem_id mapping."""
-        with _problem_id_context_lock:
-            if not hasattr(_problem_id_context, 'data'):
-                _problem_id_context.data = {}
-
-            current_mapping = _problem_id_context.data.get('req_id_to_problem_id', {})
-            current_mapping[req_id] = problem_id
-            _problem_id_context.data['req_id_to_problem_id'] = current_mapping
+        """Update req_id to problem_id mapping (thread-local, no lock needed)."""
+        if not hasattr(_problem_id_context, 'data'):
+            _problem_id_context.data = {}
+        current_mapping = _problem_id_context.data.get('req_id_to_problem_id', {})
+        current_mapping[req_id] = problem_id
+        _problem_id_context.data['req_id_to_problem_id'] = current_mapping
 
     @staticmethod
     def clear_context():
@@ -85,62 +95,37 @@ class ProblemIdContextManager:
         medium_ids: Optional[List[str]] = None,
         easy_ids: Optional[List[str]] = None,
     ):
-        """Set hard, medium, and easy problem IDs for distribution-aware processing."""
-        if not hasattr(_problem_id_context, 'data'):
-            _problem_id_context.data = {}
-        _problem_id_context.data['hard_ids'] = hard_ids or []
-        _problem_id_context.data['medium_ids'] = medium_ids or []
-        _problem_id_context.data['easy_ids'] = easy_ids or []
-        # Invalidate cached indices so they are recomputed for the next batch
-        _problem_id_context.data.pop('hard_indices', None)
-        _problem_id_context.data.pop('medium_indices', None)
-        _problem_id_context.data.pop('easy_indices', None)
-        _problem_id_context.data.pop('allowed_indices', None)
+        """Set hard, medium, and easy problem IDs for distribution-aware processing.
+
+        Uses process-level storage so the classification set from a background
+        prebuild thread is visible to the main worker thread.
+        Increments version so consumers can detect changes and rebuild caches.
+        """
+        with _difficulty_lock:
+            _difficulty_data['hard_ids'] = hard_ids or []
+            _difficulty_data['medium_ids'] = medium_ids or []
+            _difficulty_data['easy_ids'] = easy_ids or []
+            _difficulty_data['version'] += 1
 
     @staticmethod
     def get_hard_medium_ids() -> tuple[Optional[List[str]], Optional[List[str]], Optional[List[str]]]:
-        """Get hard, medium, and easy problem IDs."""
-        if not hasattr(_problem_id_context, 'data'):
-            return None, None, None
-        return (
-            _problem_id_context.data.get('hard_ids'),
-            _problem_id_context.data.get('medium_ids'),
-            _problem_id_context.data.get('easy_ids'),
-        )
+        """Get hard, medium, and easy problem IDs (process-level, cross-thread safe)."""
+        with _difficulty_lock:
+            return (
+                _difficulty_data.get('hard_ids'),
+                _difficulty_data.get('medium_ids'),
+                _difficulty_data.get('easy_ids'),
+            )
 
     @staticmethod
-    def set_hard_medium_indices(
-        hard_indices: List[int],
-        medium_indices: List[int],
-        easy_indices: List[int],
-        allowed_indices: List[int],
-    ):
-        """Cache hard, medium, and easy indices for the current batch."""
-        if not hasattr(_problem_id_context, 'data'):
-            _problem_id_context.data = {}
-        _problem_id_context.data['hard_indices'] = hard_indices
-        _problem_id_context.data['medium_indices'] = medium_indices
-        _problem_id_context.data['easy_indices'] = easy_indices
-        _problem_id_context.data['allowed_indices'] = allowed_indices
+    def get_difficulty_version() -> int:
+        """Return the monotonically increasing version counter for difficulty data.
 
-    @staticmethod
-    def get_hard_medium_indices() -> tuple[List[int], List[int], List[int], List[int]]:
-        """Get cached hard, medium, and easy indices."""
-        if not hasattr(_problem_id_context, 'data'):
-            return [], [], [], []
-        return (
-            _problem_id_context.data.get('hard_indices', []),
-            _problem_id_context.data.get('medium_indices', []),
-            _problem_id_context.data.get('easy_indices', []),
-            _problem_id_context.data.get('allowed_indices', []),
-        )
-
-    @staticmethod
-    def has_hard_medium_indices() -> bool:
-        """Check if hard/medium indices are cached."""
-        if not hasattr(_problem_id_context, 'data'):
-            return False
-        return 'hard_indices' in _problem_id_context.data
+        Consumers can compare this with a cached version to decide whether to
+        rebuild derived structures (e.g. difficulty sets).
+        """
+        with _difficulty_lock:
+            return _difficulty_data['version']
 
     @staticmethod
     def set_dynamic_config(hard_problems=None, max_quota=None):
@@ -158,20 +143,6 @@ class ProblemIdContextManager:
         if not hasattr(_problem_id_context, 'data'):
             _problem_id_context.data = {}
         _problem_id_context.data['hard_problems'] = hard_problems
-
-    @staticmethod
-    def get_dynamic_hard_problems():
-        """Get dynamic hard problems configuration."""
-        if not hasattr(_problem_id_context, 'data'):
-            return None
-        return _problem_id_context.data.get('hard_problems')
-
-    @staticmethod
-    def get_dynamic_max_quota():
-        """Get dynamic max quota configuration."""
-        if not hasattr(_problem_id_context, 'data'):
-            return None
-        return _problem_id_context.data.get('max_quota')
 
     @staticmethod
     @contextlib.contextmanager
